@@ -81,12 +81,19 @@ async def search_image(
     # 限流检查
     if not lifecycle.rate_limiter.try_acquire("global_search"):
         METRICS.rate_limited_total.labels(type="global").inc()
+        # FIX-9: 补充 quota 配额信息, 帮助调用方制定重试策略
+        bucket = lifecycle.rate_limiter._buckets.get("global_search", {})
         raise HTTPException(status_code=429, detail={
             "error": {
                 "code": "100_03_01",
                 "message": "QPS limit exceeded",
                 "request_id": request_id,
                 "retry_after_ms": 200,
+                "quota": {
+                    "limit_qps": bucket.get("rate", 0),
+                    "burst": bucket.get("burst", 0),
+                    "remaining_tokens": round(bucket.get("tokens", 0), 2),
+                },
             }
         })
 
@@ -165,7 +172,7 @@ async def readyz(request: Request):
     # FIX-C: 运行时依赖健康检查 — 任一关键依赖不可用则拒绝流量
     checks = {}
     try:
-        checks["redis"] = lifecycle.redis_client is not None and lifecycle.redis_client.ping()
+        checks["redis"] = lifecycle.redis_client is not None and await lifecycle.redis_client.ping()
     except Exception:
         checks["redis"] = False
     try:
@@ -239,15 +246,6 @@ async def degrade_release(reason: str = "", request: Request = None):
     lifecycle = request.app.state.lifecycle
     lifecycle.degrade_fsm.force_state(DegradeState.S0, reason)
     return {"status": "ok", "state": "S0"}
-
-
-@router.get("/admin/degrade/status", summary="降级状态查询")
-async def degrade_status(request: Request):
-    lifecycle = request.app.state.lifecycle
-    return {
-        "state": lifecycle.degrade_fsm.state.value,
-        "window_p99_ms": lifecycle.degrade_fsm._window.avg_p99(60),
-    }
 
 
 @router.post("/admin/config/reload", summary="配置热更新")

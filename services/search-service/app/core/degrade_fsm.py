@@ -222,10 +222,6 @@ class DegradeStateMachine:
         )
 
     @property
-    def state(self) -> DegradeState:
-        return self._state
-
-    @property
     def last_reason(self) -> str:
         """FIX-G: 最近一次状态转移的原因"""
         return getattr(self, "_last_reason", "")

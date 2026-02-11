@@ -9,7 +9,10 @@ import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.environment.CheckpointConfig.ExternalizedCheckpointCleanup;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,6 +44,17 @@ public class MerchantBitmapJob {
         env.getCheckpointConfig().setCheckpointTimeout(60_000L);
         env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5_000L);
         env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+
+        // FIX-5: Checkpoint 存储 + 重启策略 + 取消保留
+        String checkpointDir = System.getenv().getOrDefault(
+            "CHECKPOINT_DIR", "file:///tmp/flink/checkpoints/merchant-bitmap"
+        );
+        env.getCheckpointConfig().setCheckpointStorage(checkpointDir);
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(3, Time.seconds(10)));
+        env.getCheckpointConfig().setExternalizedCheckpointCleanup(
+            ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+        );
+
         env.setParallelism(4);
 
         // 从配置加载 (生产环境用 ParameterTool)
