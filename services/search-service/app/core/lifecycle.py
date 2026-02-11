@@ -278,7 +278,9 @@ class ServiceLifecycle:
             await asyncio.sleep(1)
 
     def _read_live_metrics(self) -> Tuple[float, float]:
-        """从 prometheus_client registry 读取实时 P99 和错误率"""
+        """从 prometheus_client registry 读取实时 P99 和错误率
+        FIX-AE: 改用 histogram bucket 线性插值计算 P99, 替代 avg × 2.5 估算
+        """
         try:
             from prometheus_client import REGISTRY
 
@@ -287,25 +289,41 @@ class ServiceLifecycle:
             total_errors = 0.0
 
             for metric in REGISTRY.collect():
-                # 读取 search 请求总延迟 (histogram _sum/_count)
+                # 读取 search 请求延迟 histogram
                 if metric.name == "http_request_duration_seconds":
-                    req_sum = 0.0
-                    req_count = 0
+                    # FIX-AE: 从 histogram buckets 线性插值计算 P99
+                    buckets = []  # [(upper_bound, cumulative_count)]
+                    total_count = 0
                     for sample in metric.samples:
-                        if (
-                            sample.name.endswith("_sum")
-                            and sample.labels.get("handler", "").endswith("/image/search")
-                        ):
-                            req_sum += sample.value
-                        elif (
-                            sample.name.endswith("_count")
-                            and sample.labels.get("handler", "").endswith("/image/search")
-                        ):
-                            req_count += int(sample.value)
-                    if req_count > 0:
-                        # P99 ≈ avg × 2.5 (保守估计, 生产可接 HDRHistogram)
-                        p99_ms = (req_sum / req_count) * 1000 * 2.5
-                        total_requests = float(req_count)
+                        handler = sample.labels.get("handler", "")
+                        if not handler.endswith("/image/search"):
+                            continue
+                        if sample.name.endswith("_bucket"):
+                            le = sample.labels.get("le", "")
+                            if le == "+Inf":
+                                total_count = int(sample.value)
+                            else:
+                                buckets.append((float(le), int(sample.value)))
+                        elif sample.name.endswith("_count"):
+                            total_requests = float(sample.value)
+
+                    if total_count > 0 and buckets:
+                        target = total_count * 0.99
+                        prev_bound, prev_count = 0.0, 0
+                        buckets.sort()
+                        for upper, cum_count in buckets:
+                            if cum_count >= target:
+                                bucket_count = cum_count - prev_count
+                                if bucket_count > 0:
+                                    fraction = (target - prev_count) / bucket_count
+                                    p99_ms = (prev_bound + fraction * (upper - prev_bound)) * 1000
+                                else:
+                                    p99_ms = upper * 1000
+                                break
+                            prev_bound, prev_count = upper, cum_count
+                        else:
+                            p99_ms = (buckets[-1][0] if buckets else 0.0) * 1000
+                        total_requests = float(total_count)
 
                 # 读取错误总数
                 if metric.name == "image_search_errors_total":
