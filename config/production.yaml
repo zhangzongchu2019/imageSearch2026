@@ -1,0 +1,303 @@
+# ============================================================
+# 以图搜商品系统 · 生产配置 · v1.3 生产加固
+# 对齐: BRD v4.0.1 / 系统设计 v1.2 / 技术架构 v1.3
+# ============================================================
+
+# ── 配置服务 (v1.3 新增) ──
+# 支持 K8s ConfigMap/Secret 和 Nacos 配置中心
+# 所有中间件连接参数均通过配置服务获取
+config_service:
+  backend: k8s                       # k8s | nacos | env
+  k8s:
+    config_dir: /etc/config          # ConfigMap 挂载目录
+    secret_dir: /etc/secrets         # Secret 挂载目录 (pg_password, redis_password 等)
+  nacos:
+    server_addr: ""                  # e.g. "nacos.internal:8848"
+    namespace: ""                    # 命名空间 ID
+    group: "image-search"
+    data_id: "image-search-config"
+    long_poll_timeout_ms: 30000
+  # 敏感参数通过以下方式提供 (优先级从高到低):
+  #   1. 环境变量: IMGSRCH_SECRET_PG_PASSWORD, IMGSRCH_SECRET_REDIS_PASSWORD 等
+  #   2. K8s Secret: /etc/secrets/pg_password, /etc/secrets/redis_password 等
+  #   3. Nacos 加密配置
+  secrets:
+    pg_password: "${PG_PASSWORD}"
+    redis_password: "${REDIS_PASSWORD}"
+    milvus_token: "${MILVUS_TOKEN}"
+    kafka_user: "${KAFKA_USER}"
+    kafka_password: "${KAFKA_PASSWORD}"
+    api_keys_hashes: ""              # SHA256 hash CSV, FIX #6
+
+system:
+  version: "1.3.0"
+  env: production
+  cluster_id: "imgsrch-prod-01"
+
+# ── 两区架构参数 ──
+zones:
+  hot:
+    description: "热区 HNSW (近5月 + 常青)"
+    months: 5
+    index_type: HNSW
+    params:
+      M: 24                         # v4.0 从32调至24 (内存优化)
+      efConstruction: 200
+    search_params:
+      ef_search: 192                # v4.0 从128调至192 (Recall提升)
+      ef_search_s1: 128             # S1 降级
+      ef_search_s2: 64              # S2 降级
+    estimated_vectors: 750_000_000  # ~7.5亿
+    sla: "99.99%"
+    replicas: 3
+
+  non_hot:
+    description: "非热区 DiskANN (6-18月)"
+    months_start: 6
+    months_end: 18
+    index_type: DISKANN
+    params:
+      max_degree: 64                # MD
+      search_list_size: 200         # SL
+      pq_code_budget_gb: 30
+    estimated_vectors: 2_200_000_000  # ~22亿 (滚动19.5亿 + 常青≤3亿)
+    sla: "99.5%"
+    replicas: 2
+
+  evergreen:
+    max_count: 300_000_000          # 3亿硬上限
+    green_threshold: 250_000_000
+    yellow_threshold: 280_000_000
+    min_retention_years: 2
+    ts_month_value: 999999
+
+# ── 检索引擎 ──
+search:
+  # 双路径延迟模型 (v4.0)
+  dual_path:
+    fast_path:
+      p99_target_ms: 240            # v4.0 快路径 P99
+      traffic_ratio: 0.80           # ~80% 请求
+    cascade_path:
+      p99_target_ms: 400            # v4.0 级联路径 P99
+      traffic_ratio: 0.20           # ~20% 请求
+      trigger_threshold: 0.80       # Top1 score < 0.80 触发级联
+      timeout_ms: 250               # 非热区查询超时
+
+  # ANN 检索
+  ann:
+    coarse_top_k: 2000              # ANN 粗排返回数
+    hot_timeout_ms: 150             # 热区查询超时
+    non_hot_timeout_ms: 250         # 非热区查询超时
+
+  # Stage 1.5: 标签召回 (v4.0.1 Patch #4)
+  tag_recall:
+    enabled: true
+    idf_top_k: 5                    # IDF Top-5 标签截断
+    timeout_ms: 10                  # 硬超时熔断
+    inverted_top_k: 500
+
+  # Refine 精排 (v4.0 扩池)
+  refine:
+    top_k: 2000                     # v4.0 从500扩至2000
+    top_k_s1: 1000                  # S1 降级
+    top_k_s2: 500                   # S2 降级
+    use_float32: true
+
+  # Fallback
+  fallback:
+    score_threshold: 0.80           # v4.0 与级联触发对齐
+    sub_image_top_k: 200
+    tag_top_k: 200
+    enabled: true
+
+  # 融合排序权重
+  fusion:
+    weight_global: 0.40
+    weight_sub: 0.30
+    weight_tag: 0.20
+    weight_cat: 0.10
+
+  # 置信度阈值
+  confidence:
+    high_score: 0.75
+    high_min_count: 10
+    medium_score: 0.50
+
+  # 响应
+  response:
+    max_top_k: 200
+    default_top_k: 100
+    default_time_range: "9m"
+    default_data_scope: "all"
+
+# ── 写入引擎 ──
+write:
+  # 写入可见性目标 (v4.0 三倍压缩)
+  visibility:
+    level1_p95_s: 5                 # 批量写入可查 (原15s)
+    level2_p95_s: 10                # 已有图商家可见 (原30s)
+    level3_p95_s: 15                # 新图全部可见 (原45s)
+
+  download:
+    timeout_s: 3
+    retries: 2
+    max_size_mb: 10
+    user_agent: "SZWEGO-ImageSearch/1.2"
+
+  dedup:
+    redis_ttl_days: 90
+    lock_ttl_s: 30
+
+  feature:
+    batch_size: 8
+    timeout_s: 5
+    max_sub_images: 5
+
+  kafka:
+    merchant_events_topic: "image-search.merchant-events"
+    search_logs_topic: "image-search.search-logs"
+    behavior_events_topic: "image-search.behavior-events"
+    acks: 1
+    linger_ms: 5                    # v4.0 从10ms降至5ms (可见性加速)
+    batch_size: 65536
+
+  # Flink 窗口 (v4.0)
+  flink_window_s: 1                 # v4.0 从5s降至1s (可见性加速)
+
+# ── 商家过滤 ──
+bitmap_filter:
+  grpc:
+    port: 50051
+    max_concurrent_requests: 200
+    timeout_ms: 8
+
+  rocksdb:
+    block_cache_gb: 8
+    bloom_filter_bits: 10
+    compression: lz4
+    write_buffer_mb: 128
+
+  # PushUpdate 直推 (v4.0 写入可见性)
+  push_update:
+    enabled: true
+    target_latency_ms: 50
+
+  cdc:
+    consumer_group: "bitmap-filter-cdc"
+    batch_size: 500
+    commit_interval_ms: 1000
+
+# ── 降级配置 (v1.3: 支持配置服务动态调整) ──
+# FIX #13: 所有阈值可通过配置服务 / Nacos 运行时修改, 无需重启
+degrade:
+  s0_s1:
+    p99_threshold_ms: 450           # v4.0 从350ms调至450ms
+    duration_s: 120
+    error_rate_threshold: 0.0005
+
+  s0_s2:
+    p99_threshold_ms: 800
+    duration_s: 30
+    error_rate_threshold: 0.01
+
+  recovery:
+    s1_dwell_s: 300
+    s2_dwell_s: 600
+    s3_observe_s: 600
+    s3_cooldown_s: 900
+    s3_ramp_stages: [0.1, 0.5, 1.0]
+
+  # 穿透率监控 (v4.0.1 Patch #2)
+  cascade_monitor:
+    penetration_rate_alert: 0.30    # >30% 触发架构评审
+    alert_sustain_days: 7
+
+# ── 合作方约束 (v4.0.1 Patch #3) ──
+partner:
+  min_timeout_ms: 500               # 合作方 timeout ≥500ms 强制
+
+# ── 限流 ──
+rate_limit:
+  global_search_qps: 500
+  global_search_burst: 800
+  per_caller_search_qps: 50
+  per_caller_write_qps: 100
+  unscoped_search_qps: 10
+
+# ── 基础设施连接 (v1.3: 通过配置服务提供, 支持重试) ──
+# 以下为默认值, 实际连接参数由配置服务 / K8s Secret 覆盖
+reliability:
+  # FIX #1: 连接初始化重试策略
+  init_retry:
+    max_retries: 5
+    base_delay_s: 1.0
+    max_delay_s: 30.0
+  # FIX #2: 有界线程池 (Milvus SDK 同步调用专用)
+  milvus_executor:
+    max_workers: 32                  # = max(8, workers × 4)
+    thread_name_prefix: "milvus-io"
+  # FIX #4: 分布式锁
+  distributed_lock:
+    ttl_s: 30
+    watchdog_renewal_interval_ratio: 0.333  # ttl / 3
+
+milvus:
+  host: "milvus-proxy.internal"
+  port: 19530
+  pool_size: 16
+  token: "${MILVUS_TOKEN}"
+  hot_collection: "global_images_hot"
+  non_hot_collection: "global_images_non_hot"
+  sub_collection: "sub_images"
+
+postgres:
+  host: "pg-primary.internal"
+  port: 5432
+  database: "image_search"
+  user: "${PG_USER}"
+  password: "${PG_PASSWORD}"
+  pool_min: 5
+  pool_max: 20
+  ssl: true
+
+redis:
+  host: "redis-sentinel.internal"
+  port: 26379
+  sentinel_master: "mymaster"
+  password: "${REDIS_PASSWORD}"
+  db: 0
+
+kafka:
+  bootstrap_servers: "kafka-1:9092,kafka-2:9092,kafka-3:9092"
+  security_protocol: "SASL_PLAINTEXT"
+  sasl_mechanism: "SCRAM-SHA-256"
+  sasl_username: "${KAFKA_USER}"
+  sasl_password: "${KAFKA_PASSWORD}"
+
+clickhouse:
+  host: "clickhouse.internal"
+  port: 9000
+  database: "image_search"
+
+# ── 特性开关 ──
+feature_flags:
+  enable_fallback: true
+  enable_sub_image_search: true
+  enable_tag_search: true
+  enable_behavior_report: true
+  enable_bitmap_filter: true
+  enable_refine: true
+  enable_video_write: true
+  enable_cascade_path: true         # v4.0 级联路径总开关
+  enable_push_update: true          # v4.0 PushUpdate 直推
+  enable_tag_recall_stage: true     # v4.0 Stage 1.5
+
+# ── 分布式追踪 (FIX #12, v1.3 新增) ──
+tracing:
+  enabled: true
+  trace_id_format: "w3c"            # W3C TraceContext 标准
+  propagation:
+    - "traceparent"                  # HTTP header
+    - "kafka-header"                 # Kafka record header
+  sampling_rate: 1.0                 # 1.0 = 全采样, 生产可调为 0.1

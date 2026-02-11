@@ -1,0 +1,132 @@
+# ============================================================
+# search-service Kubernetes Deployment
+# 8 replicas (4×2 AZ), GPU 共存, 滚动发布
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-service
+  namespace: image-search
+  labels:
+    app: search-service
+    version: v1.2.0
+spec:
+  replicas: 8
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: search-service
+  template:
+    metadata:
+      labels:
+        app: search-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: search-service
+      containers:
+        - name: search-service
+          image: registry.szwego.com/image-search/search-service:1.2.0
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: IMGSRCH_ENV
+              value: "production"
+            - name: PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: image-search-secrets
+                  key: pg-dsn
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: image-search-secrets
+                  key: redis-url
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: image-search-config
+                  key: kafka-brokers
+            - name: MILVUS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: image-search-config
+                  key: milvus-host
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "4"
+              memory: 8Gi
+              nvidia.com/gpu: 1
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-service
+  namespace: image-search
+spec:
+  selector:
+    app: search-service
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: search-service-hpa
+  namespace: image-search
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: search-service
+  minReplicas: 8
+  maxReplicas: 16
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: image_search_requests_total
+        target:
+          type: AverageValue
+          averageValue: "500"

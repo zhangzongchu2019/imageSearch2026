@@ -1,0 +1,181 @@
+.
+├── {proto,config,deploy
+│   └── {kubernetes,scripts},docs}
+├── config
+│   └── production.yaml
+├── deploy
+│   ├── kubernetes
+│   │   ├── search-service.yaml
+│   │   └── services.yaml
+│   └── scripts
+│       ├── clickhouse_ddl.sql
+│       ├── init_db.sql
+│       └── pg_init.sql
+├── docker-compose.yml
+├── docs
+│   └── CHANGELOG-v1.3-production-hardening.md
+├── ispv1.3
+├── Makefile
+├── proto
+│   └── bitmap_filter.proto
+├── README.md
+└── services
+    ├── {search-service
+    │   └── {app
+    │       └── {api,core,engine,model,infra},config,tests
+    │           └── {unit,integration}},write-service
+    │               └── {app
+    │                   └── {api,core,infra},config,tests},bitmap-filter-service
+    │                       └── {src
+    │                           └── main
+    │                               └── {java
+    │                                   └── com
+    │                                       └── szwego
+    │                                           └── imagesearch
+    │                                               └── bitmap
+    │                                                   └── {grpc,store,sync,degrade,config},resources,proto},src
+    │                                                       └── test
+    │                                                           └── java
+    │                                                               └── com
+    │                                                                   └── szwego
+    │                                                                       └── imagesearch
+    │                                                                           └── bitmap},flink-pipeline
+    │                                                                               └── {src
+    │                                                                                   └── main
+    │                                                                                       └── {java
+    │                                                                                           └── com
+    │                                                                                               └── szwego
+    │                                                                                                   └── imagesearch
+    │                                                                                                       └── flink
+    │                                                                                                           └── {job,function,model,config,util},resources},src
+    │                                                                                                               └── test
+    │                                                                                                                   └── java
+    │                                                                                                                       └── com
+    │                                                                                                                           └── szwego
+    │                                                                                                                               └── imagesearch
+    │                                                                                                                                   └── flink},cron-scheduler
+    │                                                                                                                                       └── {app
+    │                                                                                                                                           └── {jobs,core},config,tests}}
+    ├── bitmap-filter-service
+    │   ├── Dockerfile
+    │   ├── pom.xml
+    │   └── src
+    │       └── main
+    │           └── java
+    │               └── com
+    │                   └── szwego
+    │                       └── imagesearch
+    │                           └── bitmap
+    │                               ├── BitmapFilterApplication.java
+    │                               ├── degrade
+    │                               │   └── HealthChecker.java
+    │                               ├── grpc
+    │                               │   └── BitmapFilterHandler.java
+    │                               ├── store
+    │                               │   └── RocksDBStore.java
+    │                               └── sync
+    │                                   └── CdcKafkaConsumer.java
+    ├── cron-scheduler
+    │   ├── app
+    │   │   ├── __init__.py
+    │   │   ├── core
+    │   │   │   ├── __init__.py
+    │   │   │   └── dependencies.py
+    │   │   ├── jobs
+    │   │   │   ├── __init__.py
+    │   │   │   ├── bitmap_reconcile.py
+    │   │   │   ├── evergreen_governor.py
+    │   │   │   ├── partition_rotation.py
+    │   │   │   └── uri_cleanup.py
+    │   │   └── main.py
+    │   ├── Dockerfile
+    │   └── requirements.txt
+    ├── flink-pipeline
+    │   ├── pom.xml
+    │   └── src
+    │       └── main
+    │           └── java
+    │               └── com
+    │                   └── szwego
+    │                       └── imagesearch
+    │                           └── flink
+    │                               ├── function
+    │                               │   ├── BitmapAggregateFunction.java
+    │                               │   ├── BitmapPostgresqlSink.java
+    │                               │   └── MerchantEventDeserializer.java
+    │                               ├── job
+    │                               │   └── MerchantBitmapJob.java
+    │                               ├── model
+    │                               │   ├── BitmapUpdate.java
+    │                               │   └── MerchantEvent.java
+    │                               └── util
+    │                                   └── MerchantDictEncoder.java
+    ├── search-service
+    │   ├── app
+    │   │   ├── api
+    │   │   │   ├── __init__.py
+    │   │   │   └── routes.py
+    │   │   ├── core
+    │   │   │   ├── __init__.py
+    │   │   │   ├── config_service.py
+    │   │   │   ├── config.py
+    │   │   │   ├── degrade_fsm.py
+    │   │   │   ├── lifecycle.py
+    │   │   │   ├── lifecycle.py.bak
+    │   │   │   ├── metrics.py
+    │   │   │   ├── pipeline.py
+    │   │   │   └── utils.py
+    │   │   ├── engine
+    │   │   │   ├── __init__.py
+    │   │   │   ├── feature_extractor.py
+    │   │   │   ├── ranker.py
+    │   │   │   └── refiner.py
+    │   │   ├── infra
+    │   │   │   ├── __init__.py
+    │   │   │   ├── behavior_reporter.py
+    │   │   │   ├── bitmap_grpc_client.py
+    │   │   │   ├── milvus_client.py
+    │   │   │   ├── pb
+    │   │   │   │   ├── __init__.py
+    │   │   │   │   ├── bitmap_filter_pb2_grpc.py
+    │   │   │   │   └── bitmap_filter_pb2.py
+    │   │   │   ├── redis_client.py
+    │   │   │   ├── scope_resolver.py
+    │   │   │   ├── search_log_emitter.py
+    │   │   │   └── vocab_cache.py
+    │   │   ├── main.py
+    │   │   └── model
+    │   │       ├── __init__.py
+    │   │       └── schemas.py
+    │   ├── Dockerfile
+    │   ├── requirements.txt
+    │   └── tests
+    │       ├── __init__.py
+    │       ├── integration
+    │       │   ├── __init__.py
+    │       │   └── test_integration.py
+    │       └── unit
+    │           ├── test_degrade_fsm.py
+    │           ├── test_p0_fixes.py
+    │           ├── test_pipeline.py
+    │           ├── test_production_fixes.py
+    │           └── test_utils_and_schemas.py
+    └── write-service
+        ├── app
+        │   ├── __init__.py
+        │   ├── api
+        │   │   ├── __init__.py
+        │   │   └── update_image.py
+        │   ├── core
+        │   │   ├── __init__.py
+        │   │   ├── config_service.py
+        │   │   └── dependencies.py
+        │   ├── infra
+        │   │   └── __init__.py
+        │   └── main.py
+        ├── config
+        ├── Dockerfile
+        ├── requirements.txt
+        └── tests
+
+92 directories, 87 files

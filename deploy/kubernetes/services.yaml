@@ -1,0 +1,226 @@
+# ============================================================
+# write-service Kubernetes Deployment
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: write-service
+  labels:
+    app: image-search
+    component: write-service
+spec:
+  replicas: 4
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: write-service
+  template:
+    metadata:
+      labels:
+        app: write-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: write-service
+      containers:
+        - name: write-service
+          image: szwego/image-search-write:1.2.0
+          ports:
+            - containerPort: 8081
+          env:
+            - name: PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: image-search-secrets
+                  key: pg-dsn
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: image-search-secrets
+                  key: redis-url
+            - name: KAFKA_BROKERS
+              value: "kafka-headless:9092"
+            - name: MILVUS_HOST
+              value: "milvus-proxy"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: write-service
+spec:
+  selector:
+    app: write-service
+  ports:
+    - port: 8081
+      targetPort: 8081
+---
+# ============================================================
+# bitmap-filter-service Kubernetes Deployment
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bitmap-filter-service
+  labels:
+    app: image-search
+    component: bitmap-filter
+spec:
+  replicas: 4
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: bitmap-filter
+  template:
+    metadata:
+      labels:
+        app: bitmap-filter
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: bitmap-filter
+      containers:
+        - name: bitmap-filter
+          image: szwego/image-search-bitmap-filter:1.2.0
+          ports:
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka-headless:9092"
+            - name: ROCKSDB_DATA_DIR
+              value: "/data/rocksdb"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 12Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+          volumeMounts:
+            - name: rocksdb-data
+              mountPath: /data/rocksdb
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: rocksdb-data
+          persistentVolumeClaim:
+            claimName: bitmap-rocksdb-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bitmap-filter
+spec:
+  selector:
+    app: bitmap-filter
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+---
+# ============================================================
+# cron-scheduler Kubernetes Deployment
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cron-scheduler
+  labels:
+    app: image-search
+    component: cron-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cron-scheduler
+  template:
+    metadata:
+      labels:
+        app: cron-scheduler
+    spec:
+      containers:
+        - name: cron-scheduler
+          image: szwego/image-search-cron:1.2.0
+          env:
+            - name: PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: image-search-secrets
+                  key: pg-dsn
+            - name: MILVUS_HOST
+              value: "milvus-proxy"
+          resources:
+            requests:
+              cpu: "0.5"
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+---
+# ============================================================
+# Secrets
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: image-search-secrets
+type: Opaque
+stringData:
+  pg-dsn: "postgresql://imgsrch:changeme@pg-primary:5432/image_search?sslmode=require"
+  redis-url: "redis://:changeme@redis-sentinel:26379/0"
+  milvus-token: "changeme"
+---
+# ============================================================
+# PVC for RocksDB
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bitmap-rocksdb-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: nvme-ssd
+  resources:
+    requests:
+      storage: 500Gi

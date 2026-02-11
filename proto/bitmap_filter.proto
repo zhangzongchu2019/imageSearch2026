@@ -1,0 +1,52 @@
+syntax = "proto3";
+package imagesearch.bitmap;
+
+option java_package = "com.szwego.imagesearch.bitmap.grpc";
+option java_outer_classname = "BitmapFilterProto";
+
+service BitmapFilterService {
+    // 批量过滤: 输入候选集 + 商家 Bitmap, 返回匹配结果
+    rpc BatchFilter (BatchFilterRequest) returns (BatchFilterResponse);
+    // 单图推送更新 (写入可见性加速)
+    rpc PushUpdate (PushUpdateRequest) returns (PushUpdateResponse);
+    // 健康检查
+    rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message BatchFilterRequest {
+    repeated bytes candidate_pks = 1;    // 16 bytes each (hex-decoded image_pk)
+    bytes query_bitmap = 2;              // 序列化的 Roaring Bitmap (查询商家范围)
+    int32 max_results = 3;               // 最大返回数, 默认 0 = 不限
+}
+
+message BatchFilterResponse {
+    repeated bytes filtered_pks = 1;
+    int32 total_candidates = 2;
+    int32 filtered_count = 3;
+    float filter_ratio = 4;
+    int64 latency_us = 5;
+}
+
+message PushUpdateRequest {
+    bytes image_pk = 1;          // 16 bytes
+    bytes bitmap_delta = 2;      // 增量 Roaring Bitmap
+    bool is_evergreen = 3;
+}
+
+message PushUpdateResponse {
+    bool success = 1;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+    enum Status {
+        SERVING = 0;
+        NOT_SERVING = 1;
+        DEGRADED = 2;
+    }
+    Status status = 1;
+    int64 rocksdb_size_bytes = 2;
+    int64 last_cdc_offset = 3;
+    int64 cdc_lag_ms = 4;
+}

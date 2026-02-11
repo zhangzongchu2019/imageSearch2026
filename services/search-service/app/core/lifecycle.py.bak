@@ -1,0 +1,198 @@
+"""
+服务生命周期管理 — 初始化/关闭所有依赖
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+
+import structlog
+
+from app.core.config import get_settings
+from app.core.degrade_fsm import DegradeStateMachine
+from app.core.pipeline import SearchPipeline
+
+logger = structlog.get_logger(__name__)
+settings = get_settings()
+
+
+class TokenBucketLimiter:
+    """令牌桶限流器"""
+
+    def __init__(self):
+        self._buckets = {}
+        self._lock = asyncio.Lock()
+
+    def configure(self, name: str, rate: float, burst: int):
+        self._buckets[name] = {
+            "rate": rate,
+            "burst": burst,
+            "tokens": float(burst),
+            "last_refill": time.monotonic(),
+        }
+
+    def try_acquire(self, name: str) -> bool:
+        bucket = self._buckets.get(name)
+        if not bucket:
+            return True
+        now = time.monotonic()
+        elapsed = now - bucket["last_refill"]
+        bucket["tokens"] = min(
+            bucket["burst"], bucket["tokens"] + elapsed * bucket["rate"]
+        )
+        bucket["last_refill"] = now
+        if bucket["tokens"] >= 1.0:
+            bucket["tokens"] -= 1.0
+            return True
+        return False
+
+
+class ServiceLifecycle:
+    """管理所有服务依赖的生命周期"""
+
+    def __init__(self):
+        self.ready = False
+        self.start_time = time.monotonic()
+
+        # 将在 startup 中初始化
+        self.redis_client = None
+        self.pg_pool = None
+        self.milvus_client = None
+        self.kafka_producer = None
+        self.degrade_fsm = None
+        self.pipeline = None
+        self.rate_limiter = TokenBucketLimiter()
+        self.behavior_reporter = None
+
+    async def startup(self):
+        """按依赖顺序初始化所有组件"""
+        logger.info("lifecycle_startup_begin")
+
+        # 1. Redis
+        self.redis_client = await self._init_redis()
+
+        # 2. PostgreSQL
+        self.pg_pool = await self._init_postgres()
+
+        # 3. Milvus
+        self.milvus_client = await self._init_milvus()
+
+        # 4. Kafka
+        self.kafka_producer = await self._init_kafka()
+
+        # 5. 降级状态机
+        self.degrade_fsm = DegradeStateMachine(redis_client=self.redis_client)
+
+        # 6. 基础设施客户端
+        from app.infra.milvus_client import MilvusSearchClient
+        from app.infra.bitmap_grpc_client import BitmapFilterGrpcClient
+        from app.infra.redis_client import RedisCache
+        from app.engine.feature_extractor import FeatureExtractor
+        from app.engine.refiner import Refiner
+        from app.engine.ranker import FusionRanker
+        from app.infra.scope_resolver import ScopeResolver
+        from app.infra.vocab_cache import VocabCache
+        from app.infra.search_log_emitter import SearchLogEmitter
+        from app.infra.behavior_reporter import BehaviorReporter
+
+        ann_searcher = MilvusSearchClient(self.milvus_client)
+        bitmap_filter = BitmapFilterGrpcClient()
+        feature_extractor = FeatureExtractor()
+        refiner = Refiner(self.milvus_client)
+        ranker = FusionRanker()
+        scope_resolver = ScopeResolver(self.redis_client, self.pg_pool)
+        vocab_cache = VocabCache(self.redis_client, self.pg_pool)
+        search_logger = SearchLogEmitter(self.kafka_producer)
+        self.behavior_reporter = BehaviorReporter(self.kafka_producer)
+
+        # 7. 检索流水线
+        self.pipeline = SearchPipeline(
+            degrade_fsm=self.degrade_fsm,
+            feature_extractor=feature_extractor,
+            ann_searcher=ann_searcher,
+            bitmap_filter=bitmap_filter,
+            refiner=refiner,
+            ranker=ranker,
+            scope_resolver=scope_resolver,
+            vocab_cache=vocab_cache,
+            search_logger=search_logger,
+        )
+
+        # 8. 限流器
+        self.rate_limiter.configure(
+            "global_search",
+            rate=settings.rate_limit.global_search_qps,
+            burst=settings.rate_limit.global_search_burst,
+        )
+
+        # 9. 启动降级状态机 tick 后台任务
+        asyncio.create_task(self._degrade_tick_loop())
+
+        # 10. 预热
+        await vocab_cache.warm_up()
+
+        self.ready = True
+        logger.info("lifecycle_startup_complete")
+
+    async def shutdown(self):
+        """优雅关闭: 反序释放资源"""
+        self.ready = False
+        logger.info("lifecycle_shutdown_begin")
+
+        if self.kafka_producer:
+            await self.kafka_producer.stop()
+        if self.pg_pool:
+            await self.pg_pool.close()
+        # Redis / Milvus 由连接池自行管理
+        logger.info("lifecycle_shutdown_complete")
+
+    async def _degrade_tick_loop(self):
+        """每秒检查降级状态机"""
+        while True:
+            try:
+                # 从 Prometheus 获取实时 P99 (简化: 用固定值)
+                # 生产环境应从 prometheus_client 读取直方图
+                p99 = 0.0  # 应读取实际指标
+                error_rate = 0.0
+                self.degrade_fsm.tick(p99, error_rate)
+            except Exception as e:
+                logger.error("degrade_tick_error", error=str(e))
+            await asyncio.sleep(1)
+
+    async def _init_redis(self):
+        import redis.asyncio as aioredis
+        cfg = settings.redis
+        if cfg.sentinel_master:
+            sentinel = aioredis.Sentinel(
+                [(cfg.host, cfg.port)], password=cfg.password
+            )
+            return sentinel.master_for(cfg.sentinel_master)
+        return aioredis.Redis(
+            host=cfg.host, port=cfg.port, password=cfg.password, db=cfg.db,
+            decode_responses=True, max_connections=50,
+        )
+
+    async def _init_postgres(self):
+        import asyncpg
+        cfg = settings.postgres
+        return await asyncpg.create_pool(
+            dsn=cfg.dsn, min_size=cfg.pool_min, max_size=cfg.pool_max,
+        )
+
+    async def _init_milvus(self):
+        from pymilvus import connections
+        cfg = settings.milvus
+        connections.connect(
+            alias="default", host=cfg.host, port=cfg.port, token=cfg.token,
+        )
+        return connections
+
+    async def _init_kafka(self):
+        from aiokafka import AIOKafkaProducer
+        cfg = settings.kafka
+        producer = AIOKafkaProducer(
+            bootstrap_servers=cfg.bootstrap_servers,
+            security_protocol=cfg.security_protocol,
+        )
+        await producer.start()
+        return producer
