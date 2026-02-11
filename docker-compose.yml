@@ -17,7 +17,7 @@ services:
   # ── 应用服务 ──
 
   search-service:
-    build: ../../Downloads/image-search-platform-v1.4-fixed/services/search-service
+    build: ./services/search-service
     ports:
       - "8080:8080"
     environment:
@@ -43,7 +43,7 @@ services:
       retries: 5
 
   write-service:
-    build: ../../Downloads/image-search-platform-v1.4-fixed/services/write-service
+    build: ./services/write-service
     ports:
       - "8081:8081"
     environment:
@@ -60,7 +60,7 @@ services:
         condition: service_healthy
 
   bitmap-filter-service:
-    build: ../../Downloads/image-search-platform-v1.4-fixed/services/bitmap-filter-service
+    build: ./services/bitmap-filter-service
     ports:
       - "50051:50051"
     environment:
@@ -107,7 +107,7 @@ services:
       replicas: 2
 
   cron-scheduler:
-    build: ../../Downloads/image-search-platform-v1.4-fixed/services/cron-scheduler
+    build: ./services/cron-scheduler
     environment:
       <<: *common-env
     depends_on:

@@ -2,7 +2,7 @@ FROM maven:3.9-eclipse-temurin-21 AS builder
 WORKDIR /build
 COPY pom.xml .
 RUN mvn dependency:go-offline
-COPY ../../../../Downloads/image-search-platform-v1.4-fixed/services/bitmap-filter-service/src src/
+COPY src/ src/
 RUN mvn clean package -DskipTests
 
 FROM eclipse-temurin:21-jre-alpine
