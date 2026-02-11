@@ -1,0 +1,72 @@
+# ============================================================
+# 以图搜商品系统 · Makefile
+# ============================================================
+.PHONY: all build test clean deploy-dev lint
+
+SERVICES = search-service write-service bitmap-filter-service flink-pipeline cron-scheduler
+
+# ── 构建 ──
+build:
+	docker-compose build
+
+build-search:
+	docker build -t imgsrch/search-service:latest services/search-service
+
+build-write:
+	docker build -t imgsrch/write-service:latest services/write-service
+
+build-bitmap:
+	cd services/bitmap-filter-service && mvn clean package -DskipTests
+
+build-flink:
+	cd services/flink-pipeline && mvn clean package -DskipTests
+
+# ── 测试 ──
+test: test-python test-java
+
+test-python:
+	cd services/search-service && python -m pytest tests/ -v --cov=app --cov-report=term-missing
+	cd services/write-service && python -m pytest tests/ -v
+
+test-java:
+	cd services/flink-pipeline && mvn test
+	cd services/bitmap-filter-service && mvn test
+
+test-unit:
+	cd services/search-service && python -m pytest tests/unit/ -v
+
+test-integration:
+	docker-compose -f docker-compose.yml up -d postgres redis kafka milvus-standalone etcd minio
+	sleep 10
+	cd services/search-service && python -m pytest tests/integration/ -v
+	docker-compose down
+
+# ── 开发环境 ──
+deploy-dev:
+	docker-compose up -d
+
+deploy-down:
+	docker-compose down -v
+
+# ── 代码质量 ──
+lint:
+	cd services/search-service && python -m ruff check app/
+	cd services/write-service && python -m ruff check app/
+
+format:
+	cd services/search-service && python -m ruff format app/
+	cd services/write-service && python -m ruff format app/
+
+# ── 数据库 ──
+db-init:
+	docker-compose exec postgres psql -U imgsrch -d image_search -f /docker-entrypoint-initdb.d/01_init.sql
+
+db-migrate:
+	docker-compose exec postgres psql -U imgsrch -d image_search -f /docker-entrypoint-initdb.d/01_init.sql
+
+# ── 清理 ──
+clean:
+	docker-compose down -v --remove-orphans
+	cd services/flink-pipeline && mvn clean
+	cd services/bitmap-filter-service && mvn clean
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
