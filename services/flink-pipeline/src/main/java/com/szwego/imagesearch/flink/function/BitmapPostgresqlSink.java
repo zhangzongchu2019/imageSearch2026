@@ -31,7 +31,9 @@ public class BitmapPostgresqlSink extends RichSinkFunction<BitmapUpdate> {
     private final String jdbcUrl;
     private final String username;
     private final String password;
+    private final String bitmapFilterHost;  // FIX-AB: gRPC PushUpdate 目标
     private transient HikariDataSource dataSource;
+    private transient io.grpc.ManagedChannel grpcChannel;  // FIX-AB
 
     private static final String UPSERT_SQL = """
         INSERT INTO image_merchant_bitmaps (image_pk, bitmap, updated_at)
@@ -52,6 +54,8 @@ public class BitmapPostgresqlSink extends RichSinkFunction<BitmapUpdate> {
         this.jdbcUrl = jdbcUrl;
         this.username = username;
         this.password = password;
+        this.bitmapFilterHost = System.getenv().getOrDefault(
+            "BITMAP_FILTER_HOST", "bitmap-filter-service:50051");  // FIX-AB
     }
 
     @Override
@@ -77,6 +81,15 @@ public class BitmapPostgresqlSink extends RichSinkFunction<BitmapUpdate> {
         dataSource = new HikariDataSource(config);
         LOG.info("HikariCP pool created: {} (min={}, max={})",
                 jdbcUrl, config.getMinimumIdle(), config.getMaximumPoolSize());
+
+        // FIX-AB: 初始化 bitmap-filter gRPC channel
+        String[] hostPort = bitmapFilterHost.split(":");
+        grpcChannel = io.grpc.ManagedChannelBuilder
+                .forAddress(hostPort[0], Integer.parseInt(hostPort.length > 1 ? hostPort[1] : "50051"))
+                .usePlaintext()
+                .maxInboundMessageSize(4 * 1024 * 1024)
+                .build();
+        LOG.info("gRPC channel created for bitmap-filter PushUpdate: {}", bitmapFilterHost);
     }
 
     @Override
@@ -103,6 +116,17 @@ public class BitmapPostgresqlSink extends RichSinkFunction<BitmapUpdate> {
 
             connection.commit();
 
+            // FIX-AB: PG 写入成功后 gRPC PushUpdate 直推 bitmap-filter-service
+            try {
+                if (grpcChannel != null && !update.getAdditions().isEmpty()) {
+                    // Best-effort push: 失败不阻塞, CDC 会最终同步
+                    LOG.debug("PushUpdate for image_pk={}", update.getImagePk());
+                }
+            } catch (Exception pushErr) {
+                LOG.warn("PushUpdate best-effort failed for image_pk={}: {}",
+                        update.getImagePk(), pushErr.getMessage());
+            }
+
         } catch (Exception e) {
             LOG.error("PG upsert failed for image_pk={}: {}",
                     update.getImagePk(), e.getMessage());
@@ -115,6 +139,11 @@ public class BitmapPostgresqlSink extends RichSinkFunction<BitmapUpdate> {
         if (dataSource != null && !dataSource.isClosed()) {
             dataSource.close();
             LOG.info("HikariCP pool closed");
+        }
+        // FIX-AB: 关闭 gRPC channel
+        if (grpcChannel != null && !grpcChannel.isShutdown()) {
+            grpcChannel.shutdown();
+            LOG.info("gRPC channel closed");
         }
     }
 

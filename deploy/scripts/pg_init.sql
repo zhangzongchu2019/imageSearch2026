@@ -96,17 +96,27 @@ CREATE INDEX IF NOT EXISTS idx_scope_caller ON merchant_scope_registry (caller_i
 -- ============================================================
 -- API Key 表 (§8.1)
 -- ============================================================
+-- FIX-U: DDL 统一, api_key_hash 作为 PK (对齐 init_db.sql 和代码 SHA256 查找逻辑)
 CREATE TABLE IF NOT EXISTS api_keys (
-    key_id         VARCHAR(64)   PRIMARY KEY,
-    key_hash       CHAR(64)      NOT NULL,
+    api_key_hash   CHAR(64)      PRIMARY KEY,
     caller_id      VARCHAR(64)   NOT NULL,
-    description    TEXT,
+    description    VARCHAR(256),
     rate_limit_qps INT           NOT NULL DEFAULT 50,
     enabled        BOOLEAN       NOT NULL DEFAULT true,
     created_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_caller ON api_keys (caller_id);
+
+-- FIX-Y: 分区轮转补偿记录 (cron-scheduler 失败时写入, 供后续重试)
+CREATE TABLE IF NOT EXISTS partition_rotation_compensation (
+    partition_name VARCHAR(16)   PRIMARY KEY,
+    failed_step    VARCHAR(32)   NOT NULL,      -- milvus_release|pg_delete|milvus_drop
+    error_msg      TEXT,
+    retry_count    INT           NOT NULL DEFAULT 1,
+    created_at     TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    resolved_at    TIMESTAMPTZ
+);
 
 -- ============================================================
 -- ClickHouse DDL (§3.6) — 单独执行

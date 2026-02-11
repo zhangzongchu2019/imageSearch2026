@@ -55,6 +55,24 @@ class TokenBucketLimiter:
             return True
         return False
 
+    def status(self) -> dict:
+        """FIX-L: 暴露限流器内部状态 — 当前令牌数/速率/突发上限"""
+        result = {}
+        now = time.monotonic()
+        for name, bucket in self._buckets.items():
+            elapsed = now - bucket["last_refill"]
+            current_tokens = min(
+                bucket["burst"], bucket["tokens"] + elapsed * bucket["rate"]
+            )
+            result[name] = {
+                "rate_per_second": bucket["rate"],
+                "burst_limit": bucket["burst"],
+                "current_tokens": round(current_tokens, 2),
+                "fill_percent": round(current_tokens / bucket["burst"] * 100, 1)
+                    if bucket["burst"] > 0 else 0,
+            }
+        return result
+
 
 async def _retry_with_backoff(
     func,

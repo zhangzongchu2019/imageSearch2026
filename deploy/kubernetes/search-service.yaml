@@ -123,10 +123,12 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
+    # FIX-T: 使用 rate 指标 (由 Prometheus adapter 计算), 非原始 counter
+    # 对应 adapter 规则: rate(image_search_requests_total[1m])
     - type: Pods
       pods:
         metric:
-          name: image_search_requests_total
+          name: image_search_requests_per_second
         target:
           type: AverageValue
-          averageValue: "500"
+          averageValue: "50"

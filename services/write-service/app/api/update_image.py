@@ -24,6 +24,12 @@ from fastapi import APIRouter, HTTPException, Request
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
+from app.core.metrics import (
+    write_visibility_latency,
+    push_update_total,
+    write_stage_latency,
+)
+
 
 from pydantic import BaseModel, Field
 
@@ -194,6 +200,8 @@ async def _process_new_image(deps, image_pk: str, req: UpdateImageRequest, trace
     # 补偿日志 key — 记录已完成步骤, 用于故障恢复
     compensation_key = f"compensation:{image_pk}:{trace_id}"
     completed_steps = []
+    _process_start_ts = time.monotonic()  # FIX-B: T0 写入受理时刻
+    t1_milvus_ms = None  # FIX-B: T1 Milvus 写入完成
 
     try:
         # 1) 下载图片
@@ -243,6 +251,9 @@ async def _process_new_image(deps, image_pk: str, req: UpdateImageRequest, trace
         # 步骤 5: Milvus Upsert
         await _milvus_upsert(milvus, data, partition_name, deps.get("milvus_executor"))
         completed_steps.append("milvus_upsert")
+        t1_milvus_ms = int((time.monotonic() - _process_start_ts) * 1000)  # FIX-B: T1
+        write_visibility_latency.labels(level="t0_to_t1").observe(t1_milvus_ms / 1000)
+        write_stage_latency.labels(stage="milvus").observe(t1_milvus_ms / 1000)
 
         # 步骤 6: PG 去重记录 (事务)
         try:
@@ -280,16 +291,65 @@ async def _process_new_image(deps, image_pk: str, req: UpdateImageRequest, trace
         await _safe_incr_flush_counter(deps)
         completed_steps.append("flush_signal")
 
-        # 步骤 9: bitmap-filter 直推 (FIX #10: 使用单例 client)
+        # 步骤 9: bitmap-filter 直推 (FIX-A: 重试 + 补偿)
+        t2_start = time.monotonic()
         bitmap_push_client = deps.get("bitmap_push_client")
+        push_ok = False
         if bitmap_push_client:
-            try:
-                await asyncio.wait_for(
-                    bitmap_push_client.push_update(image_pk, req.merchant_id, is_evergreen),
-                    timeout=0.05,
+            for attempt in range(2):  # FIX-A: 最多 2 次尝试
+                try:
+                    await asyncio.wait_for(
+                        bitmap_push_client.push_update(image_pk, req.merchant_id, is_evergreen),
+                        timeout=0.05 * (attempt + 1),  # 第二次超时放宽
+                    )
+                    push_ok = True
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "bitmap_push_failed",
+                        image_pk=image_pk, attempt=attempt + 1, error=str(e),
+                    )
+
+            # FIX-A: 两次均失败 → 写补偿事件到 Kafka, CDC 会最终兜底
+            if not push_ok:
+                logger.error(
+                    "bitmap_push_compensate",
+                    image_pk=image_pk, trace_id=trace_id,
                 )
-            except Exception as e:
-                logger.warning("bitmap_push_failed", image_pk=image_pk, error=str(e))
+                try:
+                    kafka = deps.get("kafka")
+                    if kafka:
+                        await kafka.send_and_wait(
+                            "image-search.bitmap-push-compensate",
+                            value=json.dumps({
+                                "image_pk": image_pk,
+                                "merchant_id": req.merchant_id,
+                                "is_evergreen": is_evergreen,
+                                "trace_id": trace_id,
+                                "timestamp": int(time.time() * 1000),
+                            }).encode(),
+                            key=image_pk.encode(),
+                        )
+                except Exception:
+                    pass  # 补偿发送失败由 CDC 最终兜底
+
+        # FIX-B: 写入可见性端到端打点
+        t2_ms = int((time.monotonic() - t2_start) * 1000)
+        t0_to_t2_ms = int((time.monotonic() - _process_start_ts) * 1000) if _process_start_ts else None
+        logger.info(
+            "write_visibility_timing",
+            image_pk=image_pk,
+            t0_accepted_ms=0,
+            t1_milvus_ms=t1_milvus_ms,
+            t2_push_ms=t2_ms,
+            t0_to_t2_total_ms=t0_to_t2_ms,
+            push_ok=push_ok,
+        )
+        # FIX-B: Prometheus Histogram observe
+        write_stage_latency.labels(stage="bitmap_push").observe(t2_ms / 1000)
+        if t0_to_t2_ms is not None:
+            write_visibility_latency.labels(level="t0_to_t2").observe(t0_to_t2_ms / 1000)
+        push_update_total.labels(result="ok" if push_ok else "compensate").inc()
 
     except HTTPException:
         raise

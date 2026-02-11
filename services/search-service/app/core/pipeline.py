@@ -1,5 +1,5 @@
 """
-级联检索流水线 — v1.2 两区双路径架构
+级联检索流水线 — v1.4 生产加固
 Stage 0   : 降级覆盖 + merchant_scope 解析
 Stage 1   : 特征提取 (TensorRT FP16, GPU→CPU fallback)
 Stage 1.5 : 全量标签召回 (INVERTED, IDF Top-5, 10ms 熔断)
@@ -9,6 +9,11 @@ Stage 3   : 商家过滤 (Roaring Bitmap, 外部 gRPC)
 Stage 4   : Refine 精排 (float32, 2000 候选)
 Stage 5-7 : [条件] Fallback 子图+标签多路召回
 Stage 8   : 响应构建 + 异步日志
+
+v1.4 加固:
+  - P0-A: Milvus 熔断器异常 → 返回空结果 (降级安全)
+  - P0-C: bitmap 全不可用 (filter_skipped=True) → 联动 FSM 强制 S2
+  - P0-C: 连续 N 次 filter_skipped → 自动触发 force_state
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ from app.model.schemas import (
     DataScope,
     DegradeState,
     EffectiveParams,
+    EffectiveParamsSnapshot,
     SearchMeta,
     SearchRequest,
     SearchResponse,
@@ -49,6 +55,7 @@ class PipelineContext:
     start_ns: int = field(default_factory=time.monotonic_ns)
     timings: Dict[str, int] = field(default_factory=dict)
     degrade_state: DegradeState = DegradeState.S0
+    degrade_reason: Optional[str] = None  # FIX-G: timeout|overload|dependency|bitmap_skip|manual
     degraded: bool = False
     filter_skipped: bool = False
     strategy: Strategy = Strategy.FAST_PATH
@@ -88,12 +95,15 @@ from app.engine.feature_extractor import FeatureResult
 class SearchPipeline:
     """级联检索流水线 — 所有 Stage 均可独立降级
 
-    v1.2 关键变更:
+    v1.4 关键变更:
+    - P0-A: Milvus 熔断 → 安全返回空列表
+    - P0-C: bitmap 连续跳过 >= 3 次 → 强制 FSM S2
     - 两区架构: 热区 HNSW + 非热区 DiskANN
     - 双路径: 快路径 ≤240ms (80%) + 级联路径 ≤400ms (20%)
-    - Stage 1.5: 全量标签召回 (IDF Top-5, 10ms 熔断)
-    - Refine 扩池: 500→2000
     """
+
+    # bitmap 连续跳过阈值 → 触发 FSM 强制降级
+    BITMAP_SKIP_FORCE_DEGRADE_THRESHOLD = 3
 
     def __init__(
         self,
@@ -117,6 +127,9 @@ class SearchPipeline:
         self._vocab = vocab_cache
         self._logger = search_logger
 
+        # P0-C: bitmap 连续跳过计数器
+        self._bitmap_skip_consecutive = 0
+
     async def execute(self, req: SearchRequest, request_id: str) -> SearchResponse:
         ctx = PipelineContext(request_id=request_id)
 
@@ -124,6 +137,7 @@ class SearchPipeline:
         params = self._degrade.apply(req)
         ctx.degrade_state = self._degrade.state
         ctx.degraded = self._degrade.state not in (DegradeState.S0, DegradeState.S3)
+        ctx.degrade_reason = self._degrade.last_reason if ctx.degraded else None  # FIX-G
 
         if req.merchant_scope_id and not params.merchant_scope:
             params.merchant_scope = await self._scope.resolve(req.merchant_scope_id)
@@ -141,6 +155,7 @@ class SearchPipeline:
             ctx.timer_end("tag_recall", t)
 
         # ── Stage 2-H: 热区 HNSW ANN 检索 ──
+        # P0-A: CircuitBreakerOpenError → 返回空列表 (安全降级)
         t = ctx.timer_start("ann_hot")
         hot_candidates = await self._search_hot_zone(features, params)
         ctx.timer_end("ann_hot", t)
@@ -182,6 +197,27 @@ class SearchPipeline:
             ctx.filter_skipped = filter_skipped
             ctx.timer_end("filter", t)
 
+            # ── P0-C: bitmap 全不可用 → 联动 FSM 强制降级 ──
+            if filter_skipped:
+                self._bitmap_skip_consecutive += 1
+                METRICS.bitmap_filter_fallback.labels(
+                    level="skip", reason="all_levels_failed"
+                ).inc()
+                if self._bitmap_skip_consecutive >= self.BITMAP_SKIP_FORCE_DEGRADE_THRESHOLD:
+                    current_state = self._degrade.state
+                    if current_state in (DegradeState.S0, DegradeState.S1):
+                        self._degrade.force_state(
+                            DegradeState.S2,
+                            reason=f"bitmap_filter_skipped_{self._bitmap_skip_consecutive}_consecutive",
+                        )
+                        logger.error(
+                            "bitmap_skip_force_degrade",
+                            consecutive=self._bitmap_skip_consecutive,
+                            forced_state="S2",
+                        )
+            else:
+                self._bitmap_skip_consecutive = 0  # 重置计数器
+
         # ── Stage 4: Refine 精排 ──
         if settings.feature_flags.enable_refine and all_candidates:
             t = ctx.timer_start("refine")
@@ -205,6 +241,27 @@ class SearchPipeline:
             all_candidates = self._ranker.fuse(
                 all_candidates, fallback_results, [], features
             )
+
+        # ── FIX-E: 终极兜底 — 所有召回路径均为空时返回热门/常青推荐 ──
+        if not all_candidates:
+            METRICS.error_code_total.labels(code="empty_result_fallback", source="internal").inc()
+            logger.warning(
+                "empty_result_ultimate_fallback",
+                request_id=ctx.request_id,
+                degrade_state=ctx.degrade_state.value,
+            )
+            try:
+                all_candidates = await asyncio.wait_for(
+                    self._ann.search_hot(
+                        vector=features.global_vec,
+                        partition_filter="is_evergreen == true",
+                        ef_search=64,
+                        top_k=min(params.top_k, 50),
+                    ),
+                    timeout=0.2,
+                )
+            except Exception:
+                pass  # 终极兜底失败仍返回空结果
 
         # ── Stage 8: 响应构建 ──
         response = self._build_response(ctx, all_candidates, params, features)
@@ -232,6 +289,7 @@ class SearchPipeline:
             )
         except (asyncio.TimeoutError, Exception) as e:
             METRICS.gpu_fallback_total.inc()
+            METRICS.error_code_total.labels(code="gpu_fallback", source="gpu").inc()
             logger.warning("gpu_fallback", error=str(e))
             return await self._feature.extract_query(query_image_b64, device="cpu")
 
@@ -265,7 +323,10 @@ class SearchPipeline:
     async def _search_hot_zone(
         self, features: FeatureResult, params: EffectiveParams
     ) -> List[Candidate]:
-        """热区 HNSW 检索 — M=24, ef=192, P99 ≤150ms"""
+        """热区 HNSW 检索 — M=24, ef=192, P99 ≤150ms
+        P0-A: 熔断器打开 → 返回空列表 (安全降级)
+        """
+        from app.core.circuit_breaker import CircuitBreakerOpenError
         timeout_s = settings.search.ann.hot_timeout_ms / 1000
         try:
             return await asyncio.wait_for(
@@ -277,15 +338,24 @@ class SearchPipeline:
                 ),
                 timeout=timeout_s,
             )
+        except CircuitBreakerOpenError:
+            METRICS.ann_timeout_total.labels(zone="hot").inc()
+            METRICS.error_code_total.labels(code="ann_breaker_open", source="milvus").inc()
+            logger.error("hot_zone_breaker_open")
+            return []
         except asyncio.TimeoutError:
             METRICS.ann_timeout_total.labels(zone="hot").inc()
+            METRICS.error_code_total.labels(code="ann_timeout", source="milvus").inc()
             logger.error("hot_zone_timeout")
             return []
 
     async def _search_non_hot_zone(
         self, features: FeatureResult, params: EffectiveParams
     ) -> List[Candidate]:
-        """非热区 DiskANN 检索 — MD=64, SL=200, P99 ≤250ms"""
+        """非热区 DiskANN 检索 — MD=64, SL=200, P99 ≤250ms
+        P0-A: 熔断器打开 → 返回空列表
+        """
+        from app.core.circuit_breaker import CircuitBreakerOpenError
         timeout_s = settings.search.dual_path.cascade_timeout_ms / 1000
         try:
             return await asyncio.wait_for(
@@ -297,8 +367,14 @@ class SearchPipeline:
                 ),
                 timeout=timeout_s,
             )
+        except CircuitBreakerOpenError:
+            METRICS.ann_timeout_total.labels(zone="non_hot").inc()
+            METRICS.error_code_total.labels(code="ann_breaker_open", source="milvus").inc()
+            logger.warning("non_hot_zone_breaker_open")
+            return []
         except asyncio.TimeoutError:
             METRICS.ann_timeout_total.labels(zone="non_hot").inc()
+            METRICS.error_code_total.labels(code="ann_timeout", source="milvus").inc()
             logger.warning("non_hot_zone_timeout_cascade_skipped")
             return []
 
@@ -439,9 +515,19 @@ class SearchPipeline:
             degraded=ctx.degraded,
             filter_skipped=ctx.filter_skipped,
             degrade_state=ctx.degrade_state,
+            degrade_reason=ctx.degrade_reason,  # FIX-G
             search_scope_desc=scope_desc,
             latency_ms=ctx.total_ms,
             zone_hit=ctx.zone_hit,
+            effective_params=EffectiveParamsSnapshot(  # FIX-F
+                ef_search=params.ef_search,
+                search_list_size=getattr(params, "search_list_size", None),
+                refine_top_k=params.refine_top_k,
+                time_range=params.time_range.value if params.time_range else None,
+                enable_cascade=params.enable_cascade,
+                enable_sub_image=getattr(params, "enable_sub_image", False),
+                data_scope=params.data_scope.value if params.data_scope else None,
+            ),
             feature_ms=ctx.timings.get("feature"),
             ann_hot_ms=ctx.timings.get("ann_hot"),
             ann_non_hot_ms=ctx.timings.get("ann_non_hot"),

@@ -64,6 +64,7 @@ public class BitmapFilterApplication {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down...");
             server.shutdown();
+            handler.shutdown();  // FIX-V: 关闭 multiGet 线程池
             cdcConsumer.stop();
             store.close();
         }));

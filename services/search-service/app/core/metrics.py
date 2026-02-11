@@ -141,7 +141,7 @@ class _Metrics:
         self.error_code_total = Counter(
             "image_search_error_code_total",
             "Error code distribution",
-            ["code"],
+            ["code", "source"],  # FIX-D: source = milvus|bitmap|pg|redis|gpu|timeout|internal
         )
 
         self._initialized = True

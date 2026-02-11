@@ -6,7 +6,23 @@
 SERVICES = search-service write-service bitmap-filter-service flink-pipeline cron-scheduler
 
 # ── 构建 ──
-build:
+# FIX-AD: Proto 编译 (Python + Java gRPC stubs)
+proto:
+	@echo "Compiling proto → Python stubs..."
+	python -m grpc_tools.protoc \
+		-I proto/ \
+		--python_out=services/search-service/app/infra/pb/ \
+		--grpc_python_out=services/search-service/app/infra/pb/ \
+		proto/bitmap_filter.proto
+	@echo "Compiling proto → Java stubs..."
+	protoc \
+		-I proto/ \
+		--java_out=services/bitmap-filter-service/src/main/java/ \
+		--grpc-java_out=services/bitmap-filter-service/src/main/java/ \
+		proto/bitmap_filter.proto
+	@echo "Proto compilation complete."
+
+build: proto
 	docker-compose build
 
 build-search:

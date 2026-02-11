@@ -7,8 +7,8 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /install /usr/local
 WORKDIR /app
-COPY app app/
-COPY config config/
+COPY app/ app/
+COPY config/ config/
 RUN useradd -m -r appuser && chown -R appuser:appuser /app
 USER appuser
 HEALTHCHECK --interval=10s --timeout=3s CMD curl -f http://localhost:8081/docs || exit 1

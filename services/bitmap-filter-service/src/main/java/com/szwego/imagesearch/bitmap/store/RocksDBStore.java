@@ -63,7 +63,12 @@ public class RocksDBStore {
                 .setWriteBufferSize(128 * 1024 * 1024)    // 128MB
                 .setMaxWriteBufferNumber(3)
                 .setLevel0FileNumCompactionTrigger(4)
-                .setTargetFileSizeBase(256 * 1024 * 1024); // 256MB
+                .setTargetFileSizeBase(256 * 1024 * 1024)  // 256MB
+                // FIX-S: 显式 Level Compaction + 周期性强制压缩
+                .setCompactionStyle(CompactionStyle.LEVEL)
+                .setPeriodicCompactionSeconds(7 * 86400)   // 7天强制重压缩
+                .setMaxBytesForLevelBase(1024L * 1024 * 1024) // 1GB L1
+                .setMaxBytesForLevelMultiplier(10);         // L2=10GB, L3=100GB
 
             // DB options
             DBOptions dbOptions = new DBOptions()
@@ -71,7 +76,13 @@ public class RocksDBStore {
                 .setCreateMissingColumnFamilies(true)
                 .setMaxOpenFiles(-1)                       // 无限制
                 .setMaxBackgroundJobs(4)
-                .setStatsDumpPeriodSec(60);
+                .setStatsDumpPeriodSec(60)
+                // FIX-S: compaction rate limiter (防止 IO 突刺影响查询)
+                .setRateLimiter(new RateLimiter(
+                    100L * 1024 * 1024,  // 100MB/s compaction IO 上限
+                    100_000,             // refill period 100ms
+                    10                   // fairness
+                ));
 
             // Column families
             List<ColumnFamilyDescriptor> cfDescriptors = Arrays.asList(
@@ -99,6 +110,10 @@ public class RocksDBStore {
         if (cfRolling != null) cfRolling.close();
         if (cfEvergreen != null) cfEvergreen.close();
         if (db != null) db.close();
+        // FIX-W: 置 null 使 isOpen() 正确返回 false
+        cfRolling = null;
+        cfEvergreen = null;
+        db = null;
         LOG.info("RocksDB closed");
     }
 

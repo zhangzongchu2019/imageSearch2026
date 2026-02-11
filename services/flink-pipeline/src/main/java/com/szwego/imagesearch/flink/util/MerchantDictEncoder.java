@@ -1,12 +1,13 @@
 package com.szwego.imagesearch.flink.util;
 
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.api.sync.RedisCommands;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.LinkedHashMap;
@@ -18,6 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>三级缓存: 本地 LRU (100K) → Redis (24h TTL) → PG (SERIAL 自增)
  * <p>编码上限: uint32 max = 4,294,967,295, 远大于 4000 万商家
+ * <p>FIX-AA: PG 连接改为 HikariCP 连接池 (替代裸 DriverManager)
  */
 public class MerchantDictEncoder {
 
@@ -26,7 +28,7 @@ public class MerchantDictEncoder {
 
     private final Map<String, Integer> localCache;
     private RedisCommands<String, String> redis;
-    private Connection pgConnection;
+    private HikariDataSource pgDataSource;  // FIX-AA: 连接池替代单连接
 
     private static final int LOCAL_CACHE_SIZE = 100_000;
     private static final long REDIS_TTL_SECONDS = 86400;
@@ -110,8 +112,9 @@ public class MerchantDictEncoder {
     }
 
     private int pgAllocate(String merchantId) throws Exception {
-        ensurePgConnection();
-        try (PreparedStatement ps = pgConnection.prepareStatement(PG_UPSERT_SQL)) {
+        // FIX-AA: 从连接池获取连接 (自动归还)
+        try (Connection conn = pgDataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(PG_UPSERT_SQL)) {
             ps.setString(1, merchantId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
@@ -133,23 +136,34 @@ public class MerchantDictEncoder {
             LOG.warn("Redis not available for dict encoder: {}", e.getMessage());
         }
 
-        // PG
-        ensurePgConnection();
+        // FIX-AA: PG HikariCP 连接池
+        String url = System.getenv().getOrDefault(
+            "PG_JDBC_URL", "jdbc:postgresql://localhost:5432/image_search"
+        );
+        String user = System.getenv().getOrDefault("PG_USER", "postgres");
+        String pass = System.getenv().getOrDefault("PG_PASSWORD", "");
+
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(url);
+        config.setUsername(user);
+        config.setPassword(pass);
+        config.setMinimumIdle(1);
+        config.setMaximumPoolSize(3);
+        config.setConnectionTimeout(5_000);
+        config.setIdleTimeout(300_000);
+        config.setMaxLifetime(600_000);
+        config.setPoolName("flink-dict-encoder-pg");
+        pgDataSource = new HikariDataSource(config);
+        LOG.info("HikariCP pool created for dict encoder: {}", url);
     }
 
-    private void ensurePgConnection() {
-        try {
-            if (pgConnection == null || pgConnection.isClosed()) {
-                String url = System.getenv().getOrDefault(
-                    "PG_JDBC_URL", "jdbc:postgresql://localhost:5432/image_search"
-                );
-                String user = System.getenv().getOrDefault("PG_USER", "postgres");
-                String pass = System.getenv().getOrDefault("PG_PASSWORD", "");
-                pgConnection = DriverManager.getConnection(url, user, pass);
-                LOG.info("PG connected for dict encoder");
-            }
-        } catch (Exception e) {
-            LOG.error("PG connection failed: {}", e.getMessage());
+    /**
+     * FIX-AA: 优雅关闭连接池
+     */
+    public void close() {
+        if (pgDataSource != null && !pgDataSource.isClosed()) {
+            pgDataSource.close();
+            LOG.info("Dict encoder PG pool closed");
         }
     }
 }

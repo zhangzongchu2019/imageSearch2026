@@ -68,6 +68,14 @@ public class HealthChecker {
         Gauge.builder("bitmap.node_ejected", ejected, a -> a.get() ? 1.0 : 0.0)
                 .description("Whether this node is ejected from LB")
                 .register(metrics);
+        // FIX-K: CDC consumer lag 可观测指标
+        Gauge.builder("bitmap.cdc.lag_ms", lastCdcEventMs,
+                ts -> System.currentTimeMillis() - ts.get())
+                .description("CDC consumer lag in milliseconds (time since last event)")
+                .register(metrics);
+        Gauge.builder("bitmap.cdc.last_offset", lastCdcOffset, AtomicLong::get)
+                .description("Last consumed CDC offset")
+                .register(metrics);
 
         // 定时检查 PG-RocksDB 一致性
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {

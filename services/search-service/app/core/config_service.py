@@ -41,6 +41,8 @@ class ConfigService:
             "K8S_CONFIG_DIR", "/etc/config"
         )
         self._initialized = False
+        self._config_version: int = 0  # FIX-I: 配置版本号 (每次变更递增)
+        self._audit_log: List[Dict[str, Any]] = []  # FIX-I: 最近 100 条变更记录
 
     async def init(self):
         """初始化: 按后端类型加载配置"""
@@ -107,12 +109,42 @@ class ConfigService:
             self._listeners.setdefault(key, []).append(callback)
 
     def _notify_listeners(self, key: str, old_val: Any, new_val: Any):
+        # FIX-I: 配置变更审计日志
+        self._config_version += 1
+        audit_entry = {
+            "version": self._config_version,
+            "key": key,
+            "old_value": str(old_val)[:200] if old_val is not None else None,
+            "new_value": str(new_val)[:200] if new_val is not None else None,
+            "timestamp": time.time(),
+            "backend": self._backend,
+        }
+        self._audit_log.append(audit_entry)
+        if len(self._audit_log) > 100:
+            self._audit_log = self._audit_log[-100:]
+        logger.info(
+            "config_change_audit",
+            version=self._config_version,
+            key=key,
+            old_value=audit_entry["old_value"],
+            new_value=audit_entry["new_value"],
+        )
+
         callbacks = self._listeners.get(key, [])
         for cb in callbacks:
             try:
                 cb(key, old_val, new_val)
             except Exception as e:
                 logger.error("config_listener_error", key=key, error=str(e))
+
+    def get_audit_log(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """FIX-I: 获取最近的配置变更记录"""
+        return self._audit_log[-limit:]
+
+    @property
+    def config_version(self) -> int:
+        """FIX-I: 当前配置版本号"""
+        return self._config_version
 
     # ── K8s ConfigMap 加载 ──
 

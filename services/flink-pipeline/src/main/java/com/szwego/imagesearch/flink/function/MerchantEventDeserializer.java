@@ -20,6 +20,10 @@ public class MerchantEventDeserializer implements DeserializationSchema<Merchant
     private static final Logger LOG = LoggerFactory.getLogger(MerchantEventDeserializer.class);
     private transient ObjectMapper mapper;
 
+    private static final long serialVersionUID = 1L;
+    // FIX-AC: 记录失败计数，供监控告警
+    private transient long failedCount = 0;
+
     private ObjectMapper getMapper() {
         if (mapper == null) {
             mapper = new ObjectMapper()
@@ -34,8 +38,12 @@ public class MerchantEventDeserializer implements DeserializationSchema<Merchant
         try {
             return getMapper().readValue(message, MerchantEvent.class);
         } catch (Exception e) {
-            LOG.error("Failed to deserialize merchant event: {}", new String(message), e);
-            return null;
+            failedCount++;
+            // FIX-AC: 记录完整原始消息供 DLQ 回放 (前 500 字节防止日志爆炸)
+            String preview = new String(message, 0, Math.min(message.length, 500));
+            LOG.error("Failed to deserialize merchant event (total_failed={}): [{}] error: {}",
+                    failedCount, preview, e.getMessage());
+            return null;  // Flink 下游通过 .filter(Objects::nonNull) 过滤
         }
     }
 

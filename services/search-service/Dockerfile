@@ -16,7 +16,7 @@ COPY --from=builder /install /usr/local
 
 # 应用代码
 WORKDIR /app
-COPY app app/
+COPY app/ app/
 COPY config/ config/
 COPY models/ models/
 

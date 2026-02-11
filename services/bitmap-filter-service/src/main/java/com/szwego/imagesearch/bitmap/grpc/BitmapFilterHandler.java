@@ -131,6 +131,23 @@ public class BitmapFilterHandler {
         return new HealthStatus(status, sizeBytes, store.getLastCdcOffset(), cdcLagMs);
     }
 
+    /**
+     * FIX-V: 优雅关闭线程池, 防止服务关闭时线程泄露
+     */
+    public void shutdown() {
+        multiGetPool.shutdown();
+        try {
+            if (!multiGetPool.awaitTermination(3, TimeUnit.SECONDS)) {
+                multiGetPool.shutdownNow();
+                LOG.warn("multiGetPool forced shutdown");
+            }
+        } catch (InterruptedException e) {
+            multiGetPool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        LOG.info("BitmapFilterHandler multiGetPool closed");
+    }
+
     // ── 返回类型 ──
 
     public record BatchFilterResult(

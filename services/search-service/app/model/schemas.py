@@ -134,6 +134,17 @@ class SearchResultItem(BaseModel):
     tags: Optional[List[str]] = None
 
 
+class EffectiveParamsSnapshot(BaseModel):
+    """FIX-F: 检索实际生效的参数快照，便于调用方排查与复现"""
+    ef_search: Optional[int] = None
+    search_list_size: Optional[int] = None
+    refine_top_k: Optional[int] = None
+    time_range: Optional[str] = None
+    enable_cascade: bool = True
+    enable_sub_image: bool = False
+    data_scope: Optional[str] = None
+
+
 class SearchMeta(BaseModel):
     request_id: str
     total_results: int
@@ -142,9 +153,11 @@ class SearchMeta(BaseModel):
     degraded: bool = False
     filter_skipped: bool = False
     degrade_state: DegradeState = DegradeState.S0
+    degrade_reason: Optional[str] = None  # FIX-G: timeout|overload|dependency|bitmap_skip|manual|None
     search_scope_desc: str
     latency_ms: int
     zone_hit: str = "hot"  # "hot" | "hot+non_hot"
+    effective_params: Optional[EffectiveParamsSnapshot] = None  # FIX-F
 
     # 性能分解
     feature_ms: Optional[int] = None

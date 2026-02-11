@@ -151,20 +151,73 @@ async def system_status(request: Request):
     }
 
 
-@router.get("/../healthz", include_in_schema=False)
+@router.get("/healthz", include_in_schema=False)
 async def healthz():
     return {"status": "ok"}
 
 
-@router.get("/../readyz", include_in_schema=False)
+@router.get("/readyz", include_in_schema=False)
 async def readyz(request: Request):
     lifecycle = request.app.state.lifecycle
     if not lifecycle.ready:
         raise HTTPException(status_code=503, detail="not ready")
-    return {"status": "ready"}
+
+    # FIX-C: 运行时依赖健康检查 — 任一关键依赖不可用则拒绝流量
+    checks = {}
+    try:
+        checks["redis"] = lifecycle.redis_client is not None and lifecycle.redis_client.ping()
+    except Exception:
+        checks["redis"] = False
+    try:
+        from pymilvus import connections
+        checks["milvus"] = connections.has_connection("default")
+    except Exception:
+        checks["milvus"] = False
+    checks["model"] = lifecycle.pipeline is not None
+
+    all_ok = all(checks.values())
+    if not all_ok:
+        raise HTTPException(status_code=503, detail={
+            "status": "not_ready",
+            "checks": checks,
+        })
+    return {"status": "ready", "checks": checks}
 
 
 # ── 管理接口 ──
+
+@router.get("/admin/degrade/status", summary="降级状态查询 (P0-F: 测试可观测)")
+async def degrade_status(request: Request):
+    """返回 FSM 完整状态 — 含 epoch、窗口指标、Redis 连接状态"""
+    lifecycle = request.app.state.lifecycle
+    fsm = lifecycle._degrade_fsm
+    return fsm.status()
+
+
+@router.get("/admin/breakers", summary="熔断器状态查询 (P0-A+F)")
+async def breaker_status():
+    """返回所有熔断器当前状态"""
+    from app.core.circuit_breaker import all_breakers
+    return all_breakers()
+
+
+@router.post("/admin/breakers/{name}/force", summary="熔断器手动控制 (P0-F: 故障注入)")
+async def force_breaker(name: str, state: str = "open"):
+    """手动打开/关闭熔断器 — 用于故障注入测试
+
+    state: open | closed | half_open
+    """
+    from app.core.circuit_breaker import BreakerState, get_breaker
+    state_map = {
+        "open": BreakerState.OPEN,
+        "closed": BreakerState.CLOSED,
+        "half_open": BreakerState.HALF_OPEN,
+    }
+    if state not in state_map:
+        raise HTTPException(400, f"Invalid state: {state}. Use: open/closed/half_open")
+    breaker = get_breaker(name)
+    breaker.force_state(state_map[state], reason="admin_api_force")
+    return breaker.status()
 
 @router.post("/admin/degrade/override", summary="人工降级覆盖")
 async def degrade_override(
@@ -202,3 +255,21 @@ async def config_reload():
     from app.core.config import reload_settings
     reload_settings()
     return {"status": "reloaded"}
+
+
+@router.get("/admin/config/audit", summary="FIX-I: 配置变更审计日志")
+async def config_audit(request: Request, limit: int = 20):
+    """返回最近的配置变更记录, 含版本号/时间/旧值/新值"""
+    lifecycle = request.app.state.lifecycle
+    cs = lifecycle.config_service
+    return {
+        "current_version": cs.config_version,
+        "recent_changes": cs.get_audit_log(limit=min(limit, 100)),
+    }
+
+
+@router.get("/admin/rate_limiter/status", summary="FIX-L: 限流器内部状态")
+async def rate_limiter_status(request: Request):
+    """返回各令牌桶的当前令牌数、速率、突发上限"""
+    lifecycle = request.app.state.lifecycle
+    return lifecycle.rate_limiter.status()

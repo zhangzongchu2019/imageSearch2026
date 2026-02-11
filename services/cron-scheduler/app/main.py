@@ -76,16 +76,37 @@ async def partition_rotation():
                 continue
 
             logger.info("rotating_partition", partition=name, month=month_val)
+            # FIX-Y: 补偿机制 — 分步记录状态，失败时不丢失进度
+            step = "init"
             try:
+                step = "milvus_release"
                 part.release()
+                step = "pg_delete"
                 async with pg.acquire() as conn:
-                    await conn.execute(
+                    deleted = await conn.execute(
                         "DELETE FROM uri_dedup WHERE ts_month = $1", month_val
                     )
+                step = "milvus_drop"
                 coll.drop_partition(name)
                 logger.info("partition_rotated", partition=name)
             except Exception as e:
-                logger.error("partition_rotate_failed", partition=name, error=str(e))
+                logger.error(
+                    "partition_rotate_failed",
+                    partition=name, failed_step=step, error=str(e),
+                )
+                # FIX-Y: 写补偿记录到 PG, 供后续重试
+                try:
+                    async with pg.acquire() as conn:
+                        await conn.execute(
+                            """INSERT INTO partition_rotation_compensation
+                               (partition_name, failed_step, error_msg, created_at)
+                               VALUES ($1, $2, $3, now())
+                               ON CONFLICT (partition_name) DO UPDATE
+                               SET failed_step = $2, error_msg = $3, retry_count = partition_rotation_compensation.retry_count + 1""",
+                            name, step, str(e),
+                        )
+                except Exception:
+                    pass  # 补偿记录写入失败仅 log
                 break  # 失败中止
 
         await pg.close()
