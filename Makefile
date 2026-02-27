@@ -57,6 +57,44 @@ test-integration:
 	cd services/search-service && python -m pytest tests/integration/ -v
 	docker-compose down
 
+# ── 按业务部分测试 ──
+test-write:
+	cd services/write-service && python -m pytest tests/unit/ -v
+
+test-write-integ:
+	cd services/write-service && INTEGRATION_TEST=true python -m pytest tests/integration/ -v
+
+test-search:
+	cd services/search-service && python -m pytest tests/unit/ -v
+
+test-search-integ:
+	cd services/search-service && INTEGRATION_TEST=true python -m pytest tests/integration/ -v
+
+test-lifecycle:
+	cd services/cron-scheduler && python -m pytest tests/unit/ -v
+
+test-lifecycle-integ:
+	cd services/cron-scheduler && INTEGRATION_TEST=true python -m pytest tests/integration/ -v
+
+test-flink:
+	cd services/flink-pipeline && mvn test -Dgroups=unit
+
+test-flink-integ:
+	cd services/flink-pipeline && mvn verify -Pintegration
+
+test-bitmap:
+	cd services/bitmap-filter-service && mvn test -Dgroups=unit
+
+test-bitmap-integ:
+	cd services/bitmap-filter-service && mvn verify -Pintegration
+
+test-e2e:
+	E2E_TEST=true python -m pytest tests/e2e/ -v
+
+test-all: test-write test-search test-lifecycle test-flink test-bitmap
+
+test-all-integ: test-write-integ test-search-integ test-lifecycle-integ test-flink-integ test-bitmap-integ test-e2e
+
 # ── 开发环境 ──
 deploy-dev:
 	docker-compose up -d

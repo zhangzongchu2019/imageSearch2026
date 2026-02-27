@@ -108,15 +108,24 @@ class TestFeatureExtractorP0:
 
         import asyncio
         import base64
-        # 同一张 "图片"
-        img_b64 = base64.b64encode(b"\x89PNG\r\n" + b"\x00" * 100).decode()
+        import io
+        from PIL import Image
+        # 创建有效的 PNG 图片
+        img = Image.new("RGB", (32, 32), color=(128, 64, 200))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-        r1 = asyncio.get_event_loop().run_until_complete(
-            extractor.extract_query(img_b64, device="cpu")
-        )
-        r2 = asyncio.get_event_loop().run_until_complete(
-            extractor.extract_query(img_b64, device="cpu")
-        )
+        loop = asyncio.new_event_loop()
+        try:
+            r1 = loop.run_until_complete(
+                extractor.extract_query(img_b64, device="cpu")
+            )
+            r2 = loop.run_until_complete(
+                extractor.extract_query(img_b64, device="cpu")
+            )
+        finally:
+            loop.close()
         # 同图 → 同向量
         assert r1.global_vec == r2.global_vec
         assert r1.model_version == "mock-v0"
@@ -161,11 +170,10 @@ class TestPartitionFilter:
     def test_all_uses_18m_boundary(self):
         """ALL → 使用 non_hot_zone.months_end (18) 作为边界"""
         from app.model.schemas import TimeRange, EffectiveParams
+        from app.core.pipeline import SearchPipeline
 
         params = EffectiveParams(time_range=TimeRange.ALL)
         pipeline = object.__new__(SearchPipeline)
-
-        from app.core.pipeline import SearchPipeline
         expr = pipeline._build_partition_filter(params)
 
         assert "ts_month >=" in expr

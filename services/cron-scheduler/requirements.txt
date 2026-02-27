@@ -3,3 +3,5 @@ asyncpg==0.29.0
 pymilvus==2.4.0
 structlog==24.1.0
 pyyaml==6.0.1
+pytest==7.4.4
+pytest-asyncio==0.23.4
