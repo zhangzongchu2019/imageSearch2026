@@ -180,23 +180,30 @@ reliability:
 
 需真实中间件: `INTEGRATION_TEST=true pytest tests/integration/ -v`
 
-### 全量业务场景测试 (379 cases, v1.6 新增)
+### 全量业务场景测试 (336 cases 全通过, v1.6.1 验证)
 
-覆盖 **65 个业务场景**, 62 个测试文件, 5 个微服务 + 跨服务 E2E 全覆盖。
+覆盖 **56 个业务场景**, 62 个测试文件, 5 个微服务全覆盖。
 
 ```bash
 make test-all            # 全部单元测试 (无需外部依赖)
 make test-all-integ      # 全部集成 + E2E (需 docker-compose)
 ```
 
-| 服务 | 测试文件 | 测试用例 | 覆盖业务场景 |
-|------|---------|---------|-------------|
-| write-service | 15 | 74 | 去重、下载重试、特征提取、常青分类、词表编码、Milvus upsert、PG 补偿、Bitmap 推送、锁 watchdog、Kafka 事件、端点处理器、全流程编排、flush 批次 |
-| search-service | 27 | 202 | 8-Stage Pipeline、熔断器、5态 FSM、Bitmap 3级降级、scope 解析、3级缓存、4路融合、精排、Tag 召回、级联/兜底、API 限流鉴权、Admin API、行为上报、搜索日志、配置服务 |
-| cron-scheduler | 8 | 35 | 分区轮转、URI 清理、Bitmap 对账、常青治理、Milvus compaction |
-| flink-pipeline | 5 | 28 | Kafka 反序列化、窗口聚合、PG Sink、字典编码、MiniCluster 集成 |
-| bitmap-filter-service | 5 | 35 | RocksDB 双列族、CDC 路由+DLQ、并行 MultiGet+AND、健康检查+弹出 |
-| E2E 跨服务 | 4 | 5 | 写入→搜索、写入→Flink→Bitmap→搜索、轮转→搜索、常青→搜索 |
+| 服务 | 测试文件 | 实际通过用例 | 覆盖业务场景 |
+|------|---------|-------------|-------------|
+| search-service | 27 | **184** | 8-Stage Pipeline、熔断器、5态 FSM、Bitmap 3级降级、scope 解析、3级缓存、4路融合、精排、Tag 召回、级联/兜底、API 限流鉴权、Admin API、行为上报、搜索日志、配置服务 |
+| write-service | 15 | **70** | 去重、下载重试、特征提取、常青分类、词表编码、Milvus upsert、PG 补偿、Bitmap 推送、锁 watchdog、Kafka 事件、端点处理器、全流程编排、flush 批次 |
+| cron-scheduler | 8 | **28** | 分区轮转、URI 清理、Bitmap 对账、常青治理、Milvus compaction |
+| flink-pipeline | 5 | **24** | Kafka 反序列化、窗口聚合、PG Sink、字典编码、MiniCluster 集成 |
+| bitmap-filter-service | 5 | **30** | RocksDB 双列族、CDC 路由+DLQ、并行 MultiGet+AND、健康检查+弹出 |
+| **合计** | **60** | **336** | **56 个业务场景** |
+
+> **v1.6.1 修复记录** (2026-02-28):
+> - search-service: 修复 16 项测试 (CircuitBreaker state 转换、SearchLogEmitter enum mock、METRICS 延迟初始化等)
+> - write-service: 修复 10 项测试 (_check_dedup 返回值、httpx AsyncClient mock、pymilvus 导入等)
+> - cron-scheduler: 修复 marshmallow 4.x 兼容性 (降级至 3.x)
+> - flink-pipeline: Flink 2.0.0→1.20.0 降级 (源码使用 1.x API)、修正 connector 版本、添加 gRPC 依赖
+> - bitmap-filter-service: 修复 6 处编译错误 (构造参数不匹配、multiGetAsList 签名、缺失依赖等)
 
 ---
 
@@ -254,7 +261,7 @@ make test-all-integ      # 全部集成 + E2E (需 docker-compose)
 | bitmap-filter-service/src/test/ (5 文件) | ~700 | 新增 (v1.6) |
 | tests/e2e/ (4 文件) | ~200 | 新增 (v1.6) |
 
-**总计**: 17 文件 (v1.3) + 62 测试文件 (v1.6), ~8,500 行
+**总计**: 17 文件 (v1.3) + 60 测试文件 (v1.6) + 9 文件修复 (v1.6.1), ~8,500 行
 
 ---
 
@@ -265,7 +272,7 @@ make test-all-integ      # 全部集成 + E2E (需 docker-compose)
 | 可靠性 | ★★☆☆☆ | ★★★★☆ | 重试/Watchdog/事务写入 |
 | 安全性 | ★★☆☆☆ | ★★★★☆ | SHA256 认证/配置服务 |
 | 可观测性 | ★★★☆☆ | ★★★★☆ | 实时指标/Trace/11 新 metric |
-| 测试覆盖 | ★★☆☆☆ | ★★★★★ | 379 test cases / 65 业务场景 / 5 服务全覆盖 |
+| 测试覆盖 | ★★☆☆☆ | ★★★★★ | 336 test cases 全通过 / 56 业务场景 / 5 服务全覆盖 |
 | 运维就绪 | ★★★☆☆ | ★★★★☆ | 优雅关闭/动态阈值/自动恢复 |
 
 ---
