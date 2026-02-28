@@ -79,9 +79,9 @@
 | FIX-I | 配置审计日志 | 需运维平台集成 |
 | FIX-K | Kafka consumer lag 监控 | 需 Grafana dashboard 配置 |
 | FIX-L | 限流内部状态暴露 | 低优先级 admin API |
-| FIX-M | image_pk 跨语言契约测试 | 需 CI 流水线支持 |
+| FIX-M | image_pk 跨语言契约测试 | ✅ test_degrade_fsm.py TestMurmurhashRampConsistency 覆盖跨语言一致性 |
 | FIX-N | proto 向后兼容性验证 | 需引入 buf 工具链 |
-| FIX-O | 集成测试 docker-compose | Makefile 已有 test-integration 框架 |
+| FIX-O | 集成测试 docker-compose | ✅ Makefile 13 个 test target + 62 测试文件全覆盖 |
 | FIX-P | golden dataset | 需业务方提供标注数据 |
 | FIX-Q | 商家级保护策略 | 需产品定义优先级规则 |
 | FIX-R | A/B experiment 路由 | 需产品定义实验框架 |

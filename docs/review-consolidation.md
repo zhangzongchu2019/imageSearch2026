@@ -839,6 +839,17 @@ P1: 14/14 ✅ 全部完成
 P2: 5/15 本次完成 (I/K/L/S + J已合并), 其余 10 项为工具链/流程建设
 ```
 
+### 测试覆盖更新 (v1.6)
+
+v1.3 加固阶段测试: 30 cases (10 集成 + 20 单元), 仅覆盖 search-service。
+
+v1.6 全量业务场景测试: **379 cases**, 62 个测试文件, 覆盖 **65 个业务场景**, 5 个微服务 + 跨服务 E2E 全覆盖。
+
+```
+FIX-M (image_pk 跨语言契约测试): ✅ TestMurmurhashRampConsistency 覆盖
+FIX-O (集成测试 docker-compose):  ✅ Makefile 13 个 test target 全覆盖
+```
+
 ---
 
 ## 十五、8 份评审交叉分析

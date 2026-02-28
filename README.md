@@ -37,6 +37,44 @@ docker-compose build
 docker-compose up -d
 ```
 
+## 测试
+
+覆盖 65 个业务场景, 62 个测试文件, 379 个测试用例。
+
+```bash
+# 按服务运行单元测试 (无需外部依赖)
+make test-write          # write-service (15 文件, 74 用例)
+make test-search         # search-service (27 文件, 202 用例)
+make test-lifecycle      # cron-scheduler (8 文件, 35 用例)
+make test-flink          # flink-pipeline (5 文件, 28 用例)
+make test-bitmap         # bitmap-filter-service (5 文件, 35 用例)
+
+# 全部单元测试
+make test-all
+
+# 集成测试 (需 docker-compose 基础设施)
+make test-write-integ
+make test-search-integ
+make test-lifecycle-integ
+make test-flink-integ
+make test-bitmap-integ
+
+# 跨服务端到端测试 (需全部服务运行)
+make test-e2e
+
+# 全部集成 + E2E
+docker-compose up -d && sleep 30 && make test-all-integ
+```
+
+| 服务 | 单元测试 | 集成测试 | E2E |
+|------|---------|---------|-----|
+| write-service | 74 | 6 | 2 |
+| search-service | 202 | 8 | — |
+| cron-scheduler | 35 | 8 | 2 |
+| flink-pipeline | 28 | 5 | — |
+| bitmap-filter-service | 35 | 5 | — |
+| 跨服务 E2E | — | — | 5 |
+
 ## 项目结构
 
 ```
@@ -45,10 +83,17 @@ image-search-platform/
 ├── config/                      # 共享配置
 ├── services/
 │   ├── search-service/          # Python 检索服务
+│   │   └── tests/               #   单元 + 集成测试
 │   ├── write-service/           # Python 写入服务
+│   │   └── tests/               #   单元 + 集成测试
 │   ├── bitmap-filter-service/   # Java Bitmap 过滤服务
+│   │   └── src/test/            #   JUnit 5 测试
 │   ├── flink-pipeline/          # Java Flink 管道
+│   │   └── src/test/            #   JUnit 5 测试
 │   └── cron-scheduler/          # Python 定时调度
+│       └── tests/               #   单元 + 集成测试
+├── tests/
+│   └── e2e/                     # 跨服务端到端测试
 ├── deploy/
 │   ├── kubernetes/              # K8s 部署清单
 │   └── scripts/                 # 运维脚本

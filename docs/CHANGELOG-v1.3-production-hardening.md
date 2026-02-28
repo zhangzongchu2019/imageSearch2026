@@ -171,30 +171,32 @@ reliability:
 
 ## 四、测试覆盖
 
-### 集成测试 (10 cases)
+### v1.3 加固测试 (30 cases, 原有)
 
-`services/search-service/tests/integration/test_integration.py`
+| 类型 | 文件 | 用例数 |
+|------|------|--------|
+| 集成测试 | `search-service/tests/integration/test_integration.py` | 10 |
+| 单元测试 | `search-service/tests/unit/test_production_fixes.py` | 20 |
 
 需真实中间件: `INTEGRATION_TEST=true pytest tests/integration/ -v`
 
-| 测试 | 覆盖 |
-|------|------|
-| test_retry_connects_after_delay | FIX #1 重试成功 |
-| test_retry_exhausted_raises | FIX #1 重试耗尽 |
-| test_dedup_redis_then_pg | 去重完整链路 |
-| test_dedup_redis_hit | Redis 快路径 |
-| test_watchdog_renews_lock | FIX #4 锁续约 |
-| test_watchdog_stops_on_lock_loss | FIX #4 丢锁停止 |
-| test_compensation_log_on_pg_failure | FIX #9 补偿日志 |
-| test_flush_timeout_logged_not_swallowed | FIX #3 超时捕获 |
-| test_trace_id_format | FIX #12 W3C 格式 |
-| test_trace_id_uniqueness | FIX #12 唯一性 |
+### 全量业务场景测试 (379 cases, v1.6 新增)
 
-### 单元测试 (20 cases)
+覆盖 **65 个业务场景**, 62 个测试文件, 5 个微服务 + 跨服务 E2E 全覆盖。
 
-`services/search-service/tests/unit/test_production_fixes.py`
+```bash
+make test-all            # 全部单元测试 (无需外部依赖)
+make test-all-integ      # 全部集成 + E2E (需 docker-compose)
+```
 
-覆盖全部 15 项修复, mock 外部依赖。
+| 服务 | 测试文件 | 测试用例 | 覆盖业务场景 |
+|------|---------|---------|-------------|
+| write-service | 15 | 74 | 去重、下载重试、特征提取、常青分类、词表编码、Milvus upsert、PG 补偿、Bitmap 推送、锁 watchdog、Kafka 事件、端点处理器、全流程编排、flush 批次 |
+| search-service | 27 | 202 | 8-Stage Pipeline、熔断器、5态 FSM、Bitmap 3级降级、scope 解析、3级缓存、4路融合、精排、Tag 召回、级联/兜底、API 限流鉴权、Admin API、行为上报、搜索日志、配置服务 |
+| cron-scheduler | 8 | 35 | 分区轮转、URI 清理、Bitmap 对账、常青治理、Milvus compaction |
+| flink-pipeline | 5 | 28 | Kafka 反序列化、窗口聚合、PG Sink、字典编码、MiniCluster 集成 |
+| bitmap-filter-service | 5 | 35 | RocksDB 双列族、CDC 路由+DLQ、并行 MultiGet+AND、健康检查+弹出 |
+| E2E 跨服务 | 4 | 5 | 写入→搜索、写入→Flink→Bitmap→搜索、轮转→搜索、常青→搜索 |
 
 ---
 
@@ -209,8 +211,9 @@ reliability:
     IMGSRCH_SECRET_KAFKA_USER / KAFKA_PASSWORD
 □ 生成 API Key SHA256 hash, 写入 api_keys.hashes
 □ Flink pom.xml 已添加 HikariCP 5.1.0 依赖
-□ 运行单元测试: pytest tests/unit/ -v
-□ 运行集成测试: INTEGRATION_TEST=true pytest tests/integration/ -v
+□ 运行全部单元测试: make test-all
+□ 运行集成测试: make test-all-integ
+□ 运行 E2E 测试: make test-e2e
 □ 监控 Prometheus 指标:
     bitmap.pg_rocksdb_diff / bitmap.node_ejected
     image_search_errors_total / image_search_requests_total
@@ -244,8 +247,14 @@ reliability:
 | config/production.yaml | 303 | 修改 (v1.3) |
 | tests/unit/test_production_fixes.py | 236 | 新增 |
 | tests/integration/test_integration.py | 227 | 新增 |
+| write-service/tests/ (15 文件) | ~1,500 | 新增 (v1.6) |
+| search-service/tests/ (14 新文件) | ~2,000 | 新增 (v1.6) |
+| cron-scheduler/tests/ (8 文件) | ~600 | 新增 (v1.6) |
+| flink-pipeline/src/test/ (5 文件) | ~500 | 新增 (v1.6) |
+| bitmap-filter-service/src/test/ (5 文件) | ~700 | 新增 (v1.6) |
+| tests/e2e/ (4 文件) | ~200 | 新增 (v1.6) |
 
-**总计**: 17 文件, ~2,800 行
+**总计**: 17 文件 (v1.3) + 62 测试文件 (v1.6), ~8,500 行
 
 ---
 
@@ -256,7 +265,7 @@ reliability:
 | 可靠性 | ★★☆☆☆ | ★★★★☆ | 重试/Watchdog/事务写入 |
 | 安全性 | ★★☆☆☆ | ★★★★☆ | SHA256 认证/配置服务 |
 | 可观测性 | ★★★☆☆ | ★★★★☆ | 实时指标/Trace/11 新 metric |
-| 测试覆盖 | ★★☆☆☆ | ★★★★☆ | 30 test cases |
+| 测试覆盖 | ★★☆☆☆ | ★★★★★ | 379 test cases / 65 业务场景 / 5 服务全覆盖 |
 | 运维就绪 | ★★★☆☆ | ★★★★☆ | 优雅关闭/动态阈值/自动恢复 |
 
 ---
