@@ -1,0 +1,93 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "search-perf",
+    "title": "搜索性能",
+    "tags": ["imgsrch", "search"],
+    "timezone": "browser",
+    "refresh": "5s",
+    "time": { "from": "now-1h", "to": "now" },
+    "panels": [
+      {
+        "id": 1,
+        "title": "P99 搜索延迟",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(search_latency_seconds_bucket{job=\"search-service\"}[1m])) by (le))",
+            "legendFormat": "P99"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(search_latency_seconds_bucket{job=\"search-service\"}[1m])) by (le))",
+            "legendFormat": "P95"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "s" }
+        }
+      },
+      {
+        "id": 2,
+        "title": "搜索 QPS",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "targets": [
+          {
+            "expr": "sum(rate(search_requests_total{job=\"search-service\"}[1m]))",
+            "legendFormat": "QPS"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "快路径 vs 级联比例",
+        "type": "piechart",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+        "targets": [
+          {
+            "expr": "sum(search_strategy_total{strategy=\"FAST_PATH\"})",
+            "legendFormat": "快路径"
+          },
+          {
+            "expr": "sum(search_strategy_total{strategy=\"CASCADE_PATH\"})",
+            "legendFormat": "级联"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Confidence 分布",
+        "type": "piechart",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+        "targets": [
+          {
+            "expr": "sum(search_confidence_total{confidence=\"HIGH\"})",
+            "legendFormat": "HIGH"
+          },
+          {
+            "expr": "sum(search_confidence_total{confidence=\"MEDIUM\"})",
+            "legendFormat": "MEDIUM"
+          },
+          {
+            "expr": "sum(search_confidence_total{confidence=\"LOW\"})",
+            "legendFormat": "LOW"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "降级状态时间线",
+        "type": "state-timeline",
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+        "targets": [
+          {
+            "expr": "degrade_state_current{job=\"search-service\"}",
+            "legendFormat": "降级状态"
+          }
+        ]
+      }
+    ]
+  },
+  "overwrite": true
+}

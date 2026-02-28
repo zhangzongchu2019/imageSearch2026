@@ -3,8 +3,12 @@
 -- 对齐系统设计 v1.2 §3.2 PostgreSQL DDL
 -- ============================================================
 
--- 启用 RoaringBitmap 扩展
-CREATE EXTENSION IF NOT EXISTS roaringbitmap;
+-- 启用 RoaringBitmap 扩展 (可选 — 标准 PG 镜像中不可用)
+DO $$ BEGIN
+    CREATE EXTENSION IF NOT EXISTS roaringbitmap;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'roaringbitmap extension not available, skipping';
+END $$;
 
 -- ── §3.2.1 URI 全局去重表 ──
 CREATE TABLE IF NOT EXISTS uri_dedup (
@@ -16,14 +20,27 @@ CREATE TABLE IF NOT EXISTS uri_dedup (
 CREATE INDEX IF NOT EXISTS idx_uri_dedup_ts ON uri_dedup (ts_month);
 
 -- ── §3.2.2 商家 Bitmap 表 ──
-CREATE TABLE IF NOT EXISTS image_merchant_bitmaps (
-    image_pk        CHAR(32)        PRIMARY KEY,
-    bitmap          roaringbitmap   NOT NULL DEFAULT '\x3a30000000000000'::roaringbitmap,
-    is_evergreen    BOOLEAN         NOT NULL DEFAULT false,
-    merchant_count  INT GENERATED ALWAYS AS (rb_cardinality(bitmap)) STORED,
-    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
-);
-ALTER TABLE image_merchant_bitmaps REPLICA IDENTITY FULL;
+-- 注: 依赖 roaringbitmap 扩展; 若不可用则用 BYTEA 降级
+DO $$ BEGIN
+    CREATE TABLE IF NOT EXISTS image_merchant_bitmaps (
+        image_pk        CHAR(32)        PRIMARY KEY,
+        bitmap          roaringbitmap   NOT NULL DEFAULT '\x3a30000000000000'::roaringbitmap,
+        is_evergreen    BOOLEAN         NOT NULL DEFAULT false,
+        merchant_count  INT GENERATED ALWAYS AS (rb_cardinality(bitmap)) STORED,
+        updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
+    );
+    ALTER TABLE image_merchant_bitmaps REPLICA IDENTITY FULL;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Creating image_merchant_bitmaps with BYTEA fallback';
+    CREATE TABLE IF NOT EXISTS image_merchant_bitmaps (
+        image_pk        CHAR(32)        PRIMARY KEY,
+        bitmap          BYTEA           NOT NULL DEFAULT '\x',
+        is_evergreen    BOOLEAN         NOT NULL DEFAULT false,
+        merchant_count  INT             NOT NULL DEFAULT 0,
+        updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
+    );
+    ALTER TABLE image_merchant_bitmaps REPLICA IDENTITY FULL;
+END $$;
 
 -- ── §3.2.3 商家字典编码表 ──
 CREATE TABLE IF NOT EXISTS merchant_id_mapping (

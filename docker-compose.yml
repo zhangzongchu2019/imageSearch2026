@@ -108,11 +108,55 @@ services:
 
   cron-scheduler:
     build: ./services/cron-scheduler
+    ports:
+      - "8082:8082"
     environment:
       <<: *common-env
+      PORT: 8082
     depends_on:
       postgres:
         condition: service_healthy
+
+  # ── Web Console + 监控 ──
+
+  web-console:
+    build: ./web-console
+    ports:
+      - "3000:3000"
+    environment:
+      SEARCH_SERVICE_URL: http://search-service:8080
+      WRITE_SERVICE_URL: http://write-service:8081
+      CRON_SERVICE_URL: http://cron-scheduler:8082
+      UPLOAD_DIR: /tmp/imgsrch-uploads
+      BATCH_MAX_SIZE: "128"
+      BATCH_CONCURRENCY: "8"
+      PROJECT_ROOT: /project
+    volumes:
+      - .:/project:ro
+    depends_on:
+      - search-service
+      - write-service
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3002:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
 
   # ── 基础设施 ──
 
@@ -216,3 +260,5 @@ volumes:
   bitmap-rocksdb:
   flink-checkpoints:
   clickhouse-data:
+  prometheus-data:
+  grafana-data:

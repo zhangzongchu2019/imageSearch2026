@@ -22,6 +22,11 @@ target/
 .DS_Store
 Thumbs.db
 
+# Node.js
+node_modules/
+dist/
+*.tsbuildinfo
+
 # Test/Cache
 .pytest_cache/
 .mypy_cache/

@@ -12,12 +12,16 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections import deque
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 import asyncpg
 import structlog
+import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from fastapi import FastAPI, HTTPException
 from pymilvus import Collection, connections
 
 logger = structlog.get_logger(__name__)
@@ -227,39 +231,134 @@ async def milvus_compaction():
         logger.error("job:milvus_compaction error", error=str(e))
 
 
+# ── 执行历史追踪 ──
+
+# 每个任务保留最近 20 条执行记录
+_job_history: dict[str, deque] = {
+    "partition_rotation": deque(maxlen=20),
+    "uri_dedup_cleanup": deque(maxlen=20),
+    "bitmap_reconciliation": deque(maxlen=20),
+    "evergreen_pool_check": deque(maxlen=20),
+    "milvus_compaction": deque(maxlen=20),
+}
+
+JOB_FUNCTIONS = {
+    "partition_rotation": partition_rotation,
+    "uri_dedup_cleanup": uri_dedup_cleanup,
+    "bitmap_reconciliation": bitmap_reconciliation,
+    "evergreen_pool_check": evergreen_pool_check,
+    "milvus_compaction": milvus_compaction,
+}
+
+
+async def _tracked_run(name: str, func):
+    """Wrap job execution with history tracking."""
+    start = time.time()
+    try:
+        await func()
+        elapsed = int((time.time() - start) * 1000)
+        _job_history[name].append({
+            "timestamp": datetime.now().isoformat(),
+            "status": "success",
+            "duration_ms": elapsed,
+            "error": None,
+        })
+    except Exception as e:
+        elapsed = int((time.time() - start) * 1000)
+        _job_history[name].append({
+            "timestamp": datetime.now().isoformat(),
+            "status": "failed",
+            "duration_ms": elapsed,
+            "error": str(e),
+        })
+        raise
+
+
+# ── HTTP API ──
+
+scheduler = AsyncIOScheduler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.add_job(lambda: asyncio.ensure_future(_tracked_run("partition_rotation", partition_rotation)),
+                      CronTrigger(day=1, hour=0, minute=0),
+                      id="partition_rotation", misfire_grace_time=3600)
+    scheduler.add_job(lambda: asyncio.ensure_future(_tracked_run("uri_dedup_cleanup", uri_dedup_cleanup)),
+                      CronTrigger(day=1, hour=1, minute=0),
+                      id="uri_dedup_cleanup", misfire_grace_time=3600)
+    scheduler.add_job(lambda: asyncio.ensure_future(_tracked_run("bitmap_reconciliation", bitmap_reconciliation)),
+                      CronTrigger(hour=3, minute=0),
+                      id="bitmap_reconciliation", misfire_grace_time=3600)
+    scheduler.add_job(lambda: asyncio.ensure_future(_tracked_run("evergreen_pool_check", evergreen_pool_check)),
+                      CronTrigger(hour=6, minute=0),
+                      id="evergreen_pool_check", misfire_grace_time=3600)
+    scheduler.add_job(lambda: asyncio.ensure_future(_tracked_run("milvus_compaction", milvus_compaction)),
+                      CronTrigger(day_of_week="sun", hour=1, minute=0),
+                      id="milvus_compaction", misfire_grace_time=3600)
+    logger.info("cron-scheduler starting: 5 jobs registered")
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(title="cron-scheduler", lifespan=lifespan)
+
+JOB_DESCRIPTIONS = {
+    "partition_rotation": {"cron": "0 0 1 * *", "description": "分区轮转"},
+    "uri_dedup_cleanup": {"cron": "0 1 1 * *", "description": "URI 去重清理"},
+    "bitmap_reconciliation": {"cron": "0 3 * * *", "description": "Bitmap 对账"},
+    "evergreen_pool_check": {"cron": "0 6 * * *", "description": "常青池治理"},
+    "milvus_compaction": {"cron": "0 1 * * 0", "description": "Milvus 压缩"},
+}
+
+
+@app.get("/api/v1/jobs")
+async def list_jobs():
+    """返回所有任务的状态和下次执行时间."""
+    result = []
+    for job_id, meta in JOB_DESCRIPTIONS.items():
+        ap_job = scheduler.get_job(job_id)
+        next_run = ap_job.next_run_time.isoformat() if ap_job and ap_job.next_run_time else None
+        history = list(_job_history.get(job_id, []))
+        last = history[-1] if history else None
+        result.append({
+            "name": job_id,
+            "cron": meta["cron"],
+            "description": meta["description"],
+            "next_run": next_run,
+            "last_run": last["timestamp"] if last else None,
+            "last_status": last["status"] if last else None,
+        })
+    return result
+
+
+@app.post("/api/v1/jobs/{name}/trigger")
+async def trigger_job(name: str):
+    """手动触发指定任务."""
+    if name not in JOB_FUNCTIONS:
+        raise HTTPException(404, f"Job {name} not found")
+    asyncio.ensure_future(_tracked_run(name, JOB_FUNCTIONS[name]))
+    return {"status": "triggered", "job": name}
+
+
+@app.get("/api/v1/jobs/{name}/history")
+async def job_history(name: str):
+    """返回指定任务的最近 20 条执行记录."""
+    if name not in _job_history:
+        raise HTTPException(404, f"Job {name} not found")
+    return list(_job_history[name])
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
 # ── 主入口 ──
 
 def main():
-    scheduler = AsyncIOScheduler()
-
-    scheduler.add_job(partition_rotation,
-                      CronTrigger(day=1, hour=0, minute=0),
-                      id="partition_rotation", misfire_grace_time=3600)
-
-    scheduler.add_job(uri_dedup_cleanup,
-                      CronTrigger(day=1, hour=1, minute=0),
-                      id="uri_dedup_cleanup", misfire_grace_time=3600)
-
-    scheduler.add_job(bitmap_reconciliation,
-                      CronTrigger(hour=3, minute=0),
-                      id="bitmap_reconciliation", misfire_grace_time=3600)
-
-    scheduler.add_job(evergreen_pool_check,
-                      CronTrigger(hour=6, minute=0),
-                      id="evergreen_pool_check", misfire_grace_time=3600)
-
-    scheduler.add_job(milvus_compaction,
-                      CronTrigger(day_of_week="sun", hour=1, minute=0),
-                      id="milvus_compaction", misfire_grace_time=3600)
-
-    logger.info("cron-scheduler starting: 5 jobs registered")
-    scheduler.start()
-
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_forever()
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8082")))
 
 
 if __name__ == "__main__":

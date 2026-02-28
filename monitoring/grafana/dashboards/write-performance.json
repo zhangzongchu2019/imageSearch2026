@@ -1,0 +1,94 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "write-perf",
+    "title": "写入性能",
+    "tags": ["imgsrch", "write"],
+    "timezone": "browser",
+    "refresh": "10s",
+    "time": { "from": "now-1h", "to": "now" },
+    "panels": [
+      {
+        "id": 1,
+        "title": "写入 QPS",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [
+          {
+            "expr": "sum(rate(write_requests_total{job=\"write-service\"}[1m]))",
+            "legendFormat": "写入 QPS"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "T0→T1/T2 延迟",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(write_visibility_latency_seconds_bucket{stage=\"t1\"}[5m])) by (le))",
+            "legendFormat": "T0→T1 P99"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(write_visibility_latency_seconds_bucket{stage=\"t2\"}[5m])) by (le))",
+            "legendFormat": "T0→T2 P99"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "s" }
+        }
+      },
+      {
+        "id": 3,
+        "title": "去重命中率",
+        "type": "gauge",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+        "targets": [
+          {
+            "expr": "sum(rate(dedup_cache_hits_total[5m])) / (sum(rate(dedup_cache_hits_total[5m])) + sum(rate(dedup_cache_misses_total[5m])))",
+            "legendFormat": "命中率"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "percentunit", "min": 0, "max": 1 }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Bitmap Push 成功率",
+        "type": "gauge",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+        "targets": [
+          {
+            "expr": "sum(rate(push_update_total{result=\"ok\"}[5m])) / sum(rate(push_update_total[5m]))",
+            "legendFormat": "成功率"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "percentunit", "min": 0, "max": 1 }
+        }
+      },
+      {
+        "id": 5,
+        "title": "写入阶段延迟",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(write_stage_latency_seconds_bucket{stage=\"milvus\"}[5m])) by (le))",
+            "legendFormat": "Milvus"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(write_stage_latency_seconds_bucket{stage=\"bitmap_push\"}[5m])) by (le))",
+            "legendFormat": "Bitmap Push"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "s" }
+        }
+      }
+    ]
+  },
+  "overwrite": true
+}
