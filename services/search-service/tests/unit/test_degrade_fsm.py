@@ -153,15 +153,12 @@ class TestDynamicThresholdReload:
             "degrade.s0_s1.duration_s": 180,
         }.get(key, default)
         mock_cs.get.return_value = "0.001"
-        with patch("app.core.degrade_fsm.get_config_service", return_value=mock_cs, create=True):
-            try:
-                p99_th, dur, err_th = fsm._get_degrade_thresholds("s0_s1")
-                # 如果 config_service 模块存在, 应使用动态值
-                assert p99_th == 500
-                assert dur == 180
-            except ImportError:
-                # config_service 不存在, fallback 到静态配置
-                pass
+        # _get_degrade_thresholds 内部使用 from app.core.config_service import get_config_service
+        with patch("app.core.config_service.get_config_service", return_value=mock_cs):
+            p99_th, dur, err_th = fsm._get_degrade_thresholds("s0_s1")
+            # 配置服务可用, 应使用动态值
+            assert p99_th == 500
+            assert dur == 180
 
     def test_config_service_failure_fallback(self, fsm):
         """配置服务异常时 fallback 到静态阈值"""

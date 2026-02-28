@@ -2,10 +2,10 @@
 Milvus 插入测试 (热区分区 / p_999999)
 """
 import asyncio
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
-import sys
 sys.path.insert(0, ".")
 
 from app.api.update_image import _milvus_upsert
@@ -19,7 +19,10 @@ class TestMilvusUpsert:
         mock_coll.has_partition = MagicMock(return_value=True)
         mock_coll.upsert = MagicMock()
 
-        with patch("app.api.update_image.Collection", return_value=mock_coll):
+        mock_pymilvus = MagicMock()
+        mock_pymilvus.Collection = MagicMock(return_value=mock_coll)
+
+        with patch.dict(sys.modules, {"pymilvus": mock_pymilvus}):
             data = {"image_pk": "a" * 32, "global_vec": [0.1] * 256}
             await _milvus_upsert(MagicMock(), data, "p_202601")
 
@@ -32,7 +35,10 @@ class TestMilvusUpsert:
         mock_coll.has_partition = MagicMock(return_value=True)
         mock_coll.upsert = MagicMock()
 
-        with patch("app.api.update_image.Collection", return_value=mock_coll):
+        mock_pymilvus = MagicMock()
+        mock_pymilvus.Collection = MagicMock(return_value=mock_coll)
+
+        with patch.dict(sys.modules, {"pymilvus": mock_pymilvus}):
             data = {"image_pk": "b" * 32, "global_vec": [0.2] * 256}
             await _milvus_upsert(MagicMock(), data, "p_999999")
 
@@ -48,7 +54,10 @@ class TestMilvusUpsert:
         mock_coll.create_partition = MagicMock()
         mock_coll.upsert = MagicMock()
 
-        with patch("app.api.update_image.Collection", return_value=mock_coll):
+        mock_pymilvus = MagicMock()
+        mock_pymilvus.Collection = MagicMock(return_value=mock_coll)
+
+        with patch.dict(sys.modules, {"pymilvus": mock_pymilvus}):
             data = {"image_pk": "c" * 32, "global_vec": [0.3] * 256}
             await _milvus_upsert(MagicMock(), data, "p_202607")
 
@@ -63,7 +72,10 @@ class TestMilvusUpsert:
         mock_coll.has_partition = MagicMock(return_value=True)
         mock_coll.upsert = MagicMock()
 
-        with patch("app.api.update_image.Collection", return_value=mock_coll):
+        mock_pymilvus = MagicMock()
+        mock_pymilvus.Collection = MagicMock(return_value=mock_coll)
+
+        with patch.dict(sys.modules, {"pymilvus": mock_pymilvus}):
             data = {"image_pk": "d" * 32, "global_vec": [0.4] * 256}
             await _milvus_upsert(MagicMock(), data, "p_202601", executor)
 

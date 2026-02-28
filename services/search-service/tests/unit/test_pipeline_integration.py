@@ -16,10 +16,12 @@ class TestCircuitBreakerPipelineIntegration:
     @pytest.mark.asyncio
     async def test_hot_zone_breaker_open_returns_empty(self):
         """热区熔断器打开 → 热区搜索返回空, 不崩溃"""
-        from app.core.circuit_breaker import BreakerState, CircuitBreaker
+        import time as _time
+        from app.core.circuit_breaker import BreakerConfig, BreakerState, CircuitBreaker
 
-        cb = CircuitBreaker("hot_zone_test")
+        cb = CircuitBreaker("hot_zone_test", BreakerConfig(reset_timeout_s=9999))
         cb.force_state(BreakerState.OPEN)
+        cb._last_failure_time = _time.monotonic()
 
         # 验证打开状态
         assert cb.is_open is True
@@ -36,23 +38,28 @@ class TestCircuitBreakerPipelineIntegration:
         cb = CircuitBreaker("probe_test")
         cb.force_state(BreakerState.HALF_OPEN)
 
-        mock_fn = AsyncMock(return_value="probe_ok")
-        result = await cb.call_async(mock_fn)
+        # call_async 接受 coroutine 对象, 不是 callable
+        async def _probe():
+            return "probe_ok"
+        result = await cb.call_async(_probe())
         assert result == "probe_ok"
 
     @pytest.mark.asyncio
     async def test_breaker_probe_failure_reopens(self):
         """半开探测失败 → 重新打开"""
-        from app.core.circuit_breaker import BreakerState, CircuitBreaker
+        from app.core.circuit_breaker import BreakerConfig, BreakerState, CircuitBreaker
 
-        cb = CircuitBreaker("reopen_test")
+        cb = CircuitBreaker("reopen_test", BreakerConfig(reset_timeout_s=9999))
         cb.force_state(BreakerState.HALF_OPEN)
 
-        mock_fn = AsyncMock(side_effect=RuntimeError("still failing"))
-        with pytest.raises(RuntimeError):
-            await cb.call_async(mock_fn)
+        async def _fail():
+            raise RuntimeError("still failing")
 
-        assert cb.state == BreakerState.OPEN
+        with pytest.raises(RuntimeError):
+            await cb.call_async(_fail())
+
+        # After probe failure in HALF_OPEN, breaker reopens
+        assert cb._state == BreakerState.OPEN
 
 
 class TestBitmapSkipForceDegradeInPipeline:
@@ -61,9 +68,9 @@ class TestBitmapSkipForceDegradeInPipeline:
     def test_consecutive_skip_counter_logic(self):
         """连续 3 次 bitmap skip → 触发 force S2"""
         from app.core.degrade_fsm import DegradeStateMachine
-        from app.core.pipeline import BITMAP_SKIP_FORCE_DEGRADE_THRESHOLD
+        from app.core.pipeline import SearchPipeline
 
-        assert BITMAP_SKIP_FORCE_DEGRADE_THRESHOLD == 3
+        assert SearchPipeline.BITMAP_SKIP_FORCE_DEGRADE_THRESHOLD == 3
 
         fsm = DegradeStateMachine(redis_client=None)
         assert fsm.state == DegradeState.S0
@@ -91,7 +98,7 @@ class TestCascadeTriggerLogic:
         from app.core.config import get_settings
 
         settings = get_settings()
-        threshold = settings.search.cascade_trigger_score
+        threshold = settings.search.dual_path.cascade_trigger
 
         top1_score = threshold - 0.01
         should_cascade = top1_score < threshold
@@ -102,7 +109,7 @@ class TestCascadeTriggerLogic:
         from app.core.config import get_settings
 
         settings = get_settings()
-        threshold = settings.search.cascade_trigger_score
+        threshold = settings.search.dual_path.cascade_trigger
 
         top1_score = threshold + 0.01
         should_cascade = top1_score < threshold

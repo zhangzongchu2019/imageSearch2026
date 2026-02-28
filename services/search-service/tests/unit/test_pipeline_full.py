@@ -8,6 +8,9 @@ import pytest
 import sys
 sys.path.insert(0, ".")
 
+from app.core.metrics import setup_metrics
+setup_metrics()  # 确保 METRICS 已初始化
+
 from app.core.pipeline import Candidate, SearchPipeline, PipelineContext
 from app.model.schemas import DegradeState, TimeRange, DataScope, SearchRequest
 

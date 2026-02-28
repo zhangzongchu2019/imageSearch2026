@@ -2,9 +2,41 @@
 搜索日志异步发送 SearchLogEmitter 测试
 覆盖: 日志格式、性能指标收集、Kafka 发送、失败不阻塞 pipeline
 """
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+def _make_mock_params():
+    """构造与 SearchLogEmitter.emit() 兼容的 params mock"""
+    params = SimpleNamespace(
+        merchant_scope=["m001"],
+        top_k=100,
+        data_scope=SimpleNamespace(value="ALL"),
+        time_range=SimpleNamespace(value="ALL"),
+    )
+    return params
+
+
+def _make_mock_response():
+    """构造与 SearchLogEmitter.emit() 兼容的 response mock"""
+    meta = SimpleNamespace(
+        total_results=10,
+        strategy=SimpleNamespace(value="FAST_PATH"),
+        confidence=SimpleNamespace(value="HIGH"),
+        latency_ms=120,
+        feature_ms=15,
+        ann_hot_ms=80,
+        ann_non_hot_ms=0,
+        filter_ms=5,
+        refine_ms=3,
+        degraded=False,
+        filter_skipped=False,
+        degrade_state=SimpleNamespace(value="S0"),
+        zone_hit="hot",
+    )
+    return SimpleNamespace(meta=meta)
 
 
 class TestSearchLogEmitter:
@@ -20,29 +52,10 @@ class TestSearchLogEmitter:
 
         emitter = SearchLogEmitter(kafka_producer=mock_producer)
 
-        ctx = MagicMock()
-        ctx.request_id = "req_log_001"
-        ctx.timers = {"feature_ms": 10, "ann_hot_ms": 50}
-
-        params = MagicMock()
-        params.merchant_scope = ["m001"]
-        params.top_k = 100
-        params.data_scope = "ALL"
-        params.time_range = "ALL"
-
-        features = MagicMock()
-        features.global_vec = [0.1] * 256
-
-        response = MagicMock()
-        response.meta = MagicMock()
-        response.meta.total_results = 10
-        response.meta.strategy = "FAST_PATH"
-        response.meta.confidence = "HIGH"
-        response.meta.latency_ms = 120
-        response.meta.degraded = False
-        response.meta.degrade_state = "S0"
-        response.meta.filter_skipped = False
-        response.meta.zone_hit = "hot"
+        ctx = SimpleNamespace(request_id="req_log_001")
+        params = _make_mock_params()
+        features = SimpleNamespace(global_vec=[0.1] * 256)
+        response = _make_mock_response()
 
         await emitter.emit(ctx, params, features, response)
         mock_producer.send_and_wait.assert_called_once()
@@ -57,12 +70,12 @@ class TestSearchLogEmitter:
 
         emitter = SearchLogEmitter(kafka_producer=mock_producer)
 
-        ctx = MagicMock()
-        ctx.request_id = "req_log_002"
-        ctx.timers = {}
+        ctx = SimpleNamespace(request_id="req_log_002")
+        params = _make_mock_params()
+        response = _make_mock_response()
 
         # 不应抛异常
-        await emitter.emit(ctx, MagicMock(), MagicMock(), MagicMock())
+        await emitter.emit(ctx, params, SimpleNamespace(), response)
 
     @pytest.mark.asyncio
     async def test_emit_includes_performance_breakdown(self):
@@ -81,17 +94,11 @@ class TestSearchLogEmitter:
 
         emitter = SearchLogEmitter(kafka_producer=mock_producer)
 
-        ctx = MagicMock()
-        ctx.request_id = "req_perf_001"
-        ctx.timers = {
-            "feature_ms": 15,
-            "ann_hot_ms": 80,
-            "ann_non_hot_ms": 0,
-            "filter_ms": 5,
-            "refine_ms": 3,
-        }
+        ctx = SimpleNamespace(request_id="req_perf_001")
+        params = _make_mock_params()
+        response = _make_mock_response()
 
-        await emitter.emit(ctx, MagicMock(), MagicMock(), MagicMock())
+        await emitter.emit(ctx, params, SimpleNamespace(), response)
         # 验证至少被调用
         assert captured  # 有内容被捕获
 
@@ -103,9 +110,9 @@ class TestSearchLogEmitter:
         mock_producer = AsyncMock()
         emitter = SearchLogEmitter(kafka_producer=mock_producer)
 
-        ctx = MagicMock()
-        ctx.request_id = "req_key_log"
-        ctx.timers = {}
+        ctx = SimpleNamespace(request_id="req_key_log")
+        params = _make_mock_params()
+        response = _make_mock_response()
 
-        await emitter.emit(ctx, MagicMock(), MagicMock(), MagicMock())
+        await emitter.emit(ctx, params, SimpleNamespace(), response)
         assert mock_producer.send_and_wait.called

@@ -66,17 +66,19 @@ class TestAdminCircuitBreakerForce:
 
     def test_force_breaker_open(self):
         """手动打开熔断器 → 后续请求被拒"""
-        from app.core.circuit_breaker import BreakerState, CircuitBreaker
+        import time as _time
+        from app.core.circuit_breaker import BreakerConfig, BreakerState, CircuitBreaker
 
-        cb = CircuitBreaker("test_hot_zone")
+        cb = CircuitBreaker("test_hot_zone", BreakerConfig(reset_timeout_s=9999))
         cb.force_state(BreakerState.OPEN)
+        cb._last_failure_time = _time.monotonic()
         assert cb.state == BreakerState.OPEN
 
     def test_force_breaker_closed(self):
         """手动关闭熔断器 → 恢复正常"""
-        from app.core.circuit_breaker import BreakerState, CircuitBreaker
+        from app.core.circuit_breaker import BreakerConfig, BreakerState, CircuitBreaker
 
-        cb = CircuitBreaker("test_restore")
+        cb = CircuitBreaker("test_restore", BreakerConfig(reset_timeout_s=9999))
         cb.force_state(BreakerState.OPEN)
         cb.force_state(BreakerState.CLOSED)
         assert cb.state == BreakerState.CLOSED
@@ -90,12 +92,13 @@ class TestAdminCircuitBreakerForce:
         assert cb.state == BreakerState.HALF_OPEN
 
     def test_list_all_breakers(self):
-        """获取所有熔断器状态"""
-        from app.core.circuit_breaker import CircuitBreaker, _registry
+        """获取所有熔断器状态 (通过 get_breaker 注册)"""
+        from app.core.circuit_breaker import get_breaker, all_breakers
 
-        # 创建几个 breaker
-        cb1 = CircuitBreaker("breaker_a")
-        cb2 = CircuitBreaker("breaker_b")
+        # get_breaker 会自动注册到 _registry
+        get_breaker("breaker_a")
+        get_breaker("breaker_b")
 
-        assert "breaker_a" in _registry
-        assert "breaker_b" in _registry
+        status = all_breakers()
+        assert "breaker_a" in status
+        assert "breaker_b" in status

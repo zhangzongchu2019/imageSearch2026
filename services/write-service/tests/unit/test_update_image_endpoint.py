@@ -30,9 +30,6 @@ class TestUpdateImageEndpoint:
         """新图片 → status=accepted, is_new=True"""
         from app.api.update_image import update_image
 
-        mock_deps.redis.get = AsyncMock(return_value=None)
-        mock_deps.pg.acquire = AsyncMock()
-
         mock_request = MagicMock()
         mock_request.app.state.deps = mock_deps
 
@@ -44,13 +41,13 @@ class TestUpdateImageEndpoint:
         req.tags = []
 
         with patch("app.api.update_image._check_dedup", new_callable=AsyncMock) as mock_dedup:
-            mock_dedup.return_value = (True, "abc123def456" * 2 + "abcdef00")
+            mock_dedup.return_value = True  # _check_dedup 返回 bool
             with patch("app.api.update_image._process_new_image", new_callable=AsyncMock):
                 with patch("app.api.update_image._emit_merchant_event", new_callable=AsyncMock):
                     result = await update_image(req, mock_request)
 
-        assert result["status"] == "accepted"
-        assert result["is_new"] is True
+        assert result.status == "accepted"
+        assert result.is_new is True
 
     @pytest.mark.asyncio
     async def test_duplicate_image_returns_not_new(self, mock_deps):
@@ -68,12 +65,12 @@ class TestUpdateImageEndpoint:
         req.tags = []
 
         with patch("app.api.update_image._check_dedup", new_callable=AsyncMock) as mock_dedup:
-            mock_dedup.return_value = (False, "abc123def456" * 2 + "abcdef00")
+            mock_dedup.return_value = False  # _check_dedup 返回 bool
             with patch("app.api.update_image._process_new_image", new_callable=AsyncMock) as mock_process:
                 with patch("app.api.update_image._emit_merchant_event", new_callable=AsyncMock):
                     result = await update_image(req, mock_request)
 
-        assert result["is_new"] is False
+        assert result.is_new is False
         mock_process.assert_not_called()
 
     @pytest.mark.asyncio
@@ -92,7 +89,7 @@ class TestUpdateImageEndpoint:
         req.tags = []
 
         with patch("app.api.update_image._check_dedup", new_callable=AsyncMock) as mock_dedup:
-            mock_dedup.return_value = (False, "abc123def456" * 2 + "abcdef00")
+            mock_dedup.return_value = False  # _check_dedup 返回 bool
             with patch("app.api.update_image._process_new_image", new_callable=AsyncMock):
                 with patch("app.api.update_image._emit_merchant_event", new_callable=AsyncMock) as mock_emit:
                     await update_image(req, mock_request)

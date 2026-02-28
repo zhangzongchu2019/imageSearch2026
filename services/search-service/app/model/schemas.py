@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ── 枚举 ──
@@ -61,12 +61,11 @@ class SearchRequest(BaseModel):
     data_scope: DataScope = DataScope.ALL
     time_range: TimeRange = TimeRange.ALL
 
-    @field_validator("merchant_scope")
-    @classmethod
-    def validate_scope(cls, v, info):
-        if v is not None and info.data.get("merchant_scope_id"):
+    @model_validator(mode="after")
+    def validate_scope(self):
+        if self.merchant_scope is not None and self.merchant_scope_id is not None:
             raise ValueError("merchant_scope 与 merchant_scope_id 不可同时传入")
-        return v
+        return self
 
 
 class UpdateImageRequest(BaseModel):

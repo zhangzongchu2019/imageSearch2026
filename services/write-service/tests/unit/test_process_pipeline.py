@@ -10,30 +10,41 @@ import pytest
 
 @pytest.fixture
 def mock_deps():
-    deps = MagicMock()
-    deps.redis = AsyncMock()
-    deps.redis.set = AsyncMock(return_value=True)  # 锁获取成功
-    deps.redis.eval = AsyncMock(return_value=1)  # 锁释放成功
-    deps.pg = AsyncMock()
-    deps.milvus = MagicMock()
-    deps.milvus.has_partition.return_value = True
-    deps.milvus.upsert = MagicMock()
-    deps.kafka = AsyncMock()
-    deps.vocab = MagicMock()
-    deps.vocab.encode.side_effect = lambda t, v: 42 if t == "category" else [1, 2]
-    deps.bitmap_push_client = AsyncMock()
-    deps.bitmap_push_client.push_update = AsyncMock()
-    deps.instance_id = "test-pod-001"
-    deps.milvus_executor = None
+    """模拟 deps 字典 — _process_new_image 使用 deps["redis"] 字典风格访问"""
+    mock_redis = AsyncMock()
+    mock_redis.set = AsyncMock(return_value=True)  # 锁获取成功
+    mock_redis.eval = AsyncMock(return_value=1)  # 锁释放成功
+    mock_redis.get = AsyncMock(return_value=None)
 
-    # PG connection mock
     mock_conn = AsyncMock()
     mock_conn.execute = AsyncMock()
-    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
-    mock_conn.__aexit__ = AsyncMock(return_value=False)
-    deps.pg.acquire = MagicMock(return_value=mock_conn)
-    deps.pg.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
-    deps.pg.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.transaction = MagicMock(return_value=AsyncMock(
+        __aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False)
+    ))
+    mock_pg = AsyncMock()
+    mock_pg.acquire = MagicMock(return_value=AsyncMock(
+        __aenter__=AsyncMock(return_value=mock_conn),
+        __aexit__=AsyncMock(return_value=False),
+    ))
+
+    mock_milvus = MagicMock()
+    mock_vocab = MagicMock()
+    mock_vocab.encode = MagicMock(side_effect=lambda t, v: 42 if t == "category_l1" else [1, 2])
+    mock_kafka = AsyncMock()
+    mock_kafka.send_and_wait = AsyncMock()
+    mock_bitmap = AsyncMock()
+    mock_bitmap.push_update = AsyncMock()
+
+    deps = {
+        "redis": mock_redis,
+        "pg": mock_pg,
+        "milvus": mock_milvus,
+        "kafka": mock_kafka,
+        "vocab": mock_vocab,
+        "bitmap_push_client": mock_bitmap,
+        "instance_id": "test-pod-001",
+        "milvus_executor": None,
+    }
     return deps
 
 
@@ -85,7 +96,7 @@ class TestProcessNewImageLockContention:
         """锁被占用 → 直接返回, 不处理"""
         from app.api.update_image import _process_new_image
 
-        mock_deps.redis.set = AsyncMock(return_value=False)  # 锁获取失败
+        mock_deps["redis"].set = AsyncMock(return_value=False)  # 锁获取失败
 
         with patch("app.api.update_image._download_image", new_callable=AsyncMock) as mock_dl:
             try:
@@ -105,13 +116,17 @@ class TestProcessNewImageCompensation:
         """PG 写入失败 → 补偿日志写入 Redis"""
         from app.api.update_image import _process_new_image
 
-        mock_deps.redis.set = AsyncMock(return_value=True)
+        mock_deps["redis"].set = AsyncMock(return_value=True)
         # PG 执行失败
         mock_conn = AsyncMock()
         mock_conn.execute = AsyncMock(side_effect=Exception("PG connection lost"))
-        mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
-        mock_conn.__aexit__ = AsyncMock(return_value=False)
-        mock_deps.pg.acquire = MagicMock(return_value=mock_conn)
+        mock_conn.transaction = MagicMock(return_value=AsyncMock(
+            __aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False)
+        ))
+        mock_deps["pg"].acquire = MagicMock(return_value=AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_conn),
+            __aexit__=AsyncMock(return_value=False),
+        ))
 
         with patch("app.api.update_image._download_image", new_callable=AsyncMock, return_value=b"img"):
             with patch("app.api.update_image._extract_features", new_callable=AsyncMock) as mock_feat:
@@ -140,7 +155,7 @@ class TestProcessNewImageWatchdog:
         """无论成功失败, watchdog 在 finally 中停止"""
         from app.api.update_image import _process_new_image
 
-        mock_deps.redis.set = AsyncMock(return_value=True)
+        mock_deps["redis"].set = AsyncMock(return_value=True)
 
         with patch("app.api.update_image._download_image", new_callable=AsyncMock, side_effect=Exception("dl fail")):
             with patch("app.api.update_image._LockWatchdog") as mock_wd_cls:

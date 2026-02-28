@@ -121,12 +121,16 @@ class TestCircuitBreaker:
             pass
         assert b._state == BreakerState.OPEN
 
-    def test_force_state(self, breaker):
+    def test_force_state(self):
         """手动覆盖状态"""
-        breaker.force_state(BreakerState.OPEN, "test override")
-        assert breaker.state == BreakerState.OPEN
-        breaker.force_state(BreakerState.CLOSED, "restore")
-        assert breaker.state == BreakerState.CLOSED
+        import time as _time
+        b = CircuitBreaker("test_force", BreakerConfig(reset_timeout_s=9999))
+        b.force_state(BreakerState.OPEN, "test override")
+        # force_state 不设置 _last_failure_time, 需手动设置以防 state 属性自动转 HALF_OPEN
+        b._last_failure_time = _time.monotonic()
+        assert b.state == BreakerState.OPEN
+        b.force_state(BreakerState.CLOSED, "restore")
+        assert b.state == BreakerState.CLOSED
 
     @pytest.mark.asyncio
     async def test_exclude_exceptions(self):
