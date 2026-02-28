@@ -11,6 +11,7 @@ import jakarta.annotation.PreDestroy;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -44,6 +45,21 @@ public class RocksDBStore {
     private ColumnFamilyHandle cfEvergreen;
     private final AtomicLong lastCdcOffset = new AtomicLong(0);
     private final AtomicLong lastCdcEventTimeMs = new AtomicLong(System.currentTimeMillis());
+
+    /** No-arg constructor for Spring component scanning. */
+    public RocksDBStore() {
+    }
+
+    /** Standalone constructor (used by integration tests and main()). */
+    public RocksDBStore(String dataDir) {
+        this.dataDir = dataDir;
+    }
+
+    /** Standalone constructor with cache size (used by main()). */
+    public RocksDBStore(String dataDir, long blockCacheGb) {
+        this.dataDir = dataDir;
+        this.blockCacheGb = (int) blockCacheGb;
+    }
 
     @PostConstruct
     public void init() {
@@ -123,8 +139,9 @@ public class RocksDBStore {
     public List<byte[]> multiGet(List<byte[]> keys) {
         List<byte[]> results = new ArrayList<>(keys.size());
         try {
-            // 查 rolling
-            List<byte[]> rollingVals = db.multiGetAsList(cfRolling, keys);
+            // 查 rolling — multiGetAsList 需要 List<ColumnFamilyHandle>
+            List<ColumnFamilyHandle> rollingHandles = Collections.nCopies(keys.size(), cfRolling);
+            List<byte[]> rollingVals = db.multiGetAsList(rollingHandles, keys);
             // 查 evergreen (针对 rolling 中没有的)
             List<byte[]> evergreenKeys = new ArrayList<>();
             List<Integer> evergreenIdx = new ArrayList<>();
@@ -135,9 +152,10 @@ public class RocksDBStore {
                 }
             }
 
+            List<ColumnFamilyHandle> evergreenHandles = Collections.nCopies(evergreenKeys.size(), cfEvergreen);
             List<byte[]> evergreenVals = evergreenKeys.isEmpty()
                 ? List.of()
-                : db.multiGetAsList(cfEvergreen, evergreenKeys);
+                : db.multiGetAsList(evergreenHandles, evergreenKeys);
 
             // 合并结果
             for (int i = 0; i < keys.size(); i++) {
@@ -218,6 +236,27 @@ public class RocksDBStore {
      */
     public long estimateSize() {
         return getSizeBytes();
+    }
+
+    /**
+     * 写入 (String key convenience overload for integration tests)
+     */
+    public void put(String cf, String key, byte[] value) throws RocksDBException {
+        put(cf, key.getBytes(), value);
+    }
+
+    /**
+     * 删除 (String key convenience overload)
+     */
+    public void delete(String cf, String key) throws RocksDBException {
+        delete(cf, key.getBytes());
+    }
+
+    /**
+     * 单 key 读取 (String key convenience overload)
+     */
+    public byte[] get(String cf, String key) {
+        return get(cf, key.getBytes());
     }
 
     /**

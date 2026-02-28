@@ -56,37 +56,48 @@ public class HealthChecker {
 
     private final ScheduledExecutorService scheduler;
 
+    /**
+     * Standalone constructor (no PG DataSource, no metrics) — used by BitmapFilterApplication main().
+     */
+    public HealthChecker(RocksDBStore store) {
+        this(store, null, null);
+    }
+
     public HealthChecker(RocksDBStore store, DataSource pgDataSource, MeterRegistry metrics) {
         this.store = store;
         this.pgDataSource = pgDataSource;
         this.metrics = metrics;
 
-        // 注册 Prometheus 指标
-        Gauge.builder("bitmap.pg_rocksdb_diff", lastPgRocksDbDiff, AtomicLong::get)
-                .description("PG vs RocksDB row count difference")
-                .register(metrics);
-        Gauge.builder("bitmap.node_ejected", ejected, a -> a.get() ? 1.0 : 0.0)
-                .description("Whether this node is ejected from LB")
-                .register(metrics);
-        // FIX-K: CDC consumer lag 可观测指标
-        Gauge.builder("bitmap.cdc.lag_ms", lastCdcEventMs,
-                ts -> System.currentTimeMillis() - ts.get())
-                .description("CDC consumer lag in milliseconds (time since last event)")
-                .register(metrics);
-        Gauge.builder("bitmap.cdc.last_offset", lastCdcOffset, AtomicLong::get)
-                .description("Last consumed CDC offset")
-                .register(metrics);
+        // 注册 Prometheus 指标 (skip if no MeterRegistry)
+        if (metrics != null) {
+            Gauge.builder("bitmap.pg_rocksdb_diff", lastPgRocksDbDiff, AtomicLong::get)
+                    .description("PG vs RocksDB row count difference")
+                    .register(metrics);
+            Gauge.builder("bitmap.node_ejected", ejected, a -> a.get() ? 1.0 : 0.0)
+                    .description("Whether this node is ejected from LB")
+                    .register(metrics);
+            // FIX-K: CDC consumer lag 可观测指标
+            Gauge.builder("bitmap.cdc.lag_ms", lastCdcEventMs,
+                    ts -> System.currentTimeMillis() - ts.get())
+                    .description("CDC consumer lag in milliseconds (time since last event)")
+                    .register(metrics);
+            Gauge.builder("bitmap.cdc.last_offset", lastCdcOffset, AtomicLong::get)
+                    .description("Last consumed CDC offset")
+                    .register(metrics);
+        }
 
-        // 定时检查 PG-RocksDB 一致性
+        // 定时检查 PG-RocksDB 一致性 (only if DataSource available)
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "health-checker");
             t.setDaemon(true);
             return t;
         });
-        scheduler.scheduleWithFixedDelay(
-                this::checkPgRocksDbDiff,
-                CHECK_INTERVAL_S, CHECK_INTERVAL_S, TimeUnit.SECONDS
-        );
+        if (pgDataSource != null) {
+            scheduler.scheduleWithFixedDelay(
+                    this::checkPgRocksDbDiff,
+                    CHECK_INTERVAL_S, CHECK_INTERVAL_S, TimeUnit.SECONDS
+            );
+        }
     }
 
     public void onCdcEvent(long offset) {
@@ -165,7 +176,7 @@ public class HealthChecker {
             LOG.error("Failed to mark rebuild request", e);
         }
 
-        metrics.counter("bitmap.node_ejected_total").increment();
+        if (metrics != null) metrics.counter("bitmap.node_ejected_total").increment();
     }
 
     private void recoverToLoadBalancer(long diff) {
@@ -176,7 +187,7 @@ public class HealthChecker {
                 diff, DIFF_RECOVER_THRESHOLD, CONSECUTIVE_SAMPLES_TO_RECOVER);
 
         store.setMetadata("rebuild_requested", "false");
-        metrics.counter("bitmap.node_recovered_total").increment();
+        if (metrics != null) metrics.counter("bitmap.node_recovered_total").increment();
     }
 
     private long queryPgCount() throws Exception {

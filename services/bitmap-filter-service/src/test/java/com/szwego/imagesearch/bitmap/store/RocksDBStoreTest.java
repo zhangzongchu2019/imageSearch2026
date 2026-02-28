@@ -8,6 +8,7 @@ import org.rocksdb.*;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -113,7 +114,7 @@ class RocksDBStoreTest {
 
         // MultiGet from rolling
         List<byte[]> keys = Arrays.asList("k1".getBytes(), "k2".getBytes());
-        List<byte[]> rollingVals = db.multiGetAsList(cfRolling, keys);
+        List<byte[]> rollingVals = db.multiGetAsList(Collections.nCopies(keys.size(), cfRolling), keys);
 
         assertNotNull(rollingVals.get(0));  // k1 in rolling
         assertNull(rollingVals.get(1));     // k2 not in rolling

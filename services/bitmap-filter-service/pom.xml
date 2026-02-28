@@ -16,6 +16,9 @@
 
     <properties>
         <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
         <grpc.version>1.65.1</grpc.version>
         <protobuf.version>4.27.2</protobuf.version>
         <rocksdb.version>9.7.4</rocksdb.version>
@@ -57,6 +60,12 @@
             <groupId>org.roaringbitmap</groupId>
             <artifactId>RoaringBitmap</artifactId>
             <version>${roaring.version}</version>
+        </dependency>
+
+        <!-- Jackson (CDC JSON parsing) -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
         </dependency>
 
         <!-- Kafka (CDC consumer) -->

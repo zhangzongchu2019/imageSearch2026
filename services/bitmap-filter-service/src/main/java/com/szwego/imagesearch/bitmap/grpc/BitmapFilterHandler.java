@@ -1,7 +1,6 @@
 package com.szwego.imagesearch.bitmap.grpc;
 
 import com.szwego.imagesearch.bitmap.store.RocksDBStore;
-import io.grpc.stub.StreamObserver;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.roaringbitmap.RoaringBitmap;
@@ -53,7 +52,7 @@ public class BitmapFilterHandler {
             byte[] queryBitmapBytes,
             int maxResults) {
 
-        Timer.Sample sample = Timer.start(metrics);
+        Timer.Sample sample = metrics != null ? Timer.start(metrics) : null;
         try {
             // 1. 反序列化查询 Bitmap
             RoaringBitmap queryBitmap = new RoaringBitmap();
@@ -88,7 +87,9 @@ public class BitmapFilterHandler {
             LOG.error("BatchFilter failed: {}", e.getMessage(), e);
             throw new RuntimeException("Filter error", e);
         } finally {
-            sample.stop(metrics.timer("bitmap.filter.latency"));
+            if (sample != null && metrics != null) {
+                sample.stop(metrics.timer("bitmap.filter.latency"));
+            }
         }
     }
 

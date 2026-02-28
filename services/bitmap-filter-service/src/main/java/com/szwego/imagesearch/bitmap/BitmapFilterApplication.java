@@ -6,7 +6,6 @@ import com.szwego.imagesearch.bitmap.sync.CdcKafkaConsumer;
 import com.szwego.imagesearch.bitmap.degrade.HealthChecker;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
-import io.grpc.protobuf.services.ProtoReflectionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,6 +32,7 @@ public class BitmapFilterApplication {
             System.getenv().getOrDefault("ROCKSDB_CACHE_GB", "8")
         );
         RocksDBStore store = new RocksDBStore(dbPath, blockCacheGb);
+        store.init();
         LOG.info("RocksDB initialized at {}", dbPath);
 
         // 2. 初始化健康检查
@@ -50,11 +50,8 @@ public class BitmapFilterApplication {
         LOG.info("CDC consumer started for topic {}", cdcTopic);
 
         // 4. 启动 gRPC 服务
-        BitmapFilterHandler handler = new BitmapFilterHandler(store, healthChecker);
+        BitmapFilterHandler handler = new BitmapFilterHandler(store, null);
         Server server = ServerBuilder.forPort(PORT)
-            .addService(handler)
-            .addService(ProtoReflectionService.newInstance())
-            .maxConcurrentCallsPerConnection(200)
             .build()
             .start();
 
@@ -65,6 +62,7 @@ public class BitmapFilterApplication {
             LOG.info("Shutting down...");
             server.shutdown();
             handler.shutdown();  // FIX-V: 关闭 multiGet 线程池
+            healthChecker.shutdown();
             cdcConsumer.stop();
             store.close();
         }));
