@@ -38,12 +38,7 @@ COPY nginx.conf /etc/nginx/http.d/default.conf
 RUN mkdir -p /tmp/imgsrch-uploads
 
 # Start script
-COPY <<'EOF' /app/start.sh
-#!/bin/sh
-nginx
-exec node --import tsx src/index.ts
-EOF
-RUN chmod +x /app/start.sh
+RUN printf '#!/bin/sh\nnginx\nexec node --import tsx src/index.ts\n' > /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 3000
 
