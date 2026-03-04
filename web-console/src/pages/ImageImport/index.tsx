@@ -1,11 +1,13 @@
-import { useState } from 'react';
-import { Tabs, Card, Upload, Form, Input, Button, Select, message, Table, Tag, Progress, Alert } from 'antd';
-import { InboxOutlined, UploadOutlined } from '@ant-design/icons';
+import { useState, useRef, useCallback, useEffect } from 'react';
+import { Tabs, Card, Upload, Form, Input, InputNumber, Button, Select, Switch, message, Table, Tag, Progress, Alert } from 'antd';
+import { InboxOutlined, UploadOutlined, FileTextOutlined, PlayCircleOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd';
 import { useImageUpload } from '../../hooks/useImageUpload';
 import { useBatchOperation } from '../../hooks/useBatchOperation';
 import { bffApi } from '../../api/bffApi';
 import { useHistoryStore } from '../../stores/historyStore';
+import { randomMerchantId, randomProductId } from '../../utils/testData';
+import type { FileImportProgress } from '../../api/types';
 
 const { Dragger } = Upload;
 const { TextArea } = Input;
@@ -20,7 +22,21 @@ function SingleImport() {
   const { upload, uploading, uploadedUrl } = useImageUpload();
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<any>(null);
+  const [testMode, setTestMode] = useState(false);
   const addRecord = useHistoryStore((s) => s.addRecord);
+
+  const handleTestModeChange = (checked: boolean) => {
+    setTestMode(checked);
+    if (checked) {
+      form.setFieldsValue({
+        merchant_id: randomMerchantId(),
+        product_id: randomProductId(),
+        category_l1: 'clothing',
+      });
+    } else {
+      form.setFieldsValue({ merchant_id: undefined, product_id: undefined, category_l1: undefined });
+    }
+  };
 
   const handleUpload = async (file: File) => {
     await upload(file);
@@ -67,6 +83,9 @@ function SingleImport() {
       </Dragger>
 
       <Form form={form} layout="vertical">
+        <Form.Item label="测试模式" tooltip="开启后自动填充测试参数">
+          <Switch checked={testMode} onChange={handleTestModeChange} />
+        </Form.Item>
         <Form.Item name="merchant_id" label="商家 ID" rules={[{ required: true }]}>
           <Input placeholder="merchant_001" />
         </Form.Item>
@@ -100,7 +119,21 @@ function SingleImport() {
 function BatchImport() {
   const [form] = Form.useForm();
   const [urlList, setUrlList] = useState('');
+  const [testMode, setTestMode] = useState(false);
   const { progress, running, start } = useBatchOperation('/api/bff/batch/import');
+
+  const handleTestModeChange = (checked: boolean) => {
+    setTestMode(checked);
+    if (checked) {
+      form.setFieldsValue({
+        merchant_id: randomMerchantId(),
+        product_id: randomProductId(),
+        category_l1: 'clothing',
+      });
+    } else {
+      form.setFieldsValue({ merchant_id: undefined, product_id: undefined, category_l1: undefined });
+    }
+  };
 
   const handleStart = async () => {
     const meta = await form.validateFields();
@@ -126,6 +159,9 @@ function BatchImport() {
   return (
     <div>
       <Form form={form} layout="vertical" style={{ maxWidth: 600 }}>
+        <Form.Item label="测试模式" tooltip="开启后自动填充测试参数">
+          <Switch checked={testMode} onChange={handleTestModeChange} />
+        </Form.Item>
         <Form.Item name="merchant_id" label="商家 ID" rules={[{ required: true }]}>
           <Input />
         </Form.Item>
@@ -171,6 +207,200 @@ function BatchImport() {
   );
 }
 
+const STAGE_LABELS: Record<string, string> = {
+  collect: '收集 URL',
+  download: '下载图片',
+  extract: '特征提取',
+  milvus: '写入 Milvus',
+  pg: '写入 PostgreSQL',
+  done: '完成',
+  error: '错误',
+};
+
+function FileImport() {
+  const [file, setFile] = useState<File | null>(null);
+  const [count, setCount] = useState(10000);
+  const [skipKafka, setSkipKafka] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState<FileImportProgress | null>(null);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [checkpoint, setCheckpoint] = useState<{ exists: boolean; stage?: string; done?: number; count?: number } | null>(null);
+  const logRef = useRef<HTMLPreElement>(null);
+
+  // Check for existing checkpoint on mount
+  useEffect(() => {
+    bffApi.getImportCheckpoint().then(({ data }) => setCheckpoint(data)).catch(() => {});
+  }, []);
+
+  const appendLog = useCallback((line: string) => {
+    setLogs((prev) => {
+      const next = [...prev, line];
+      return next.length > 200 ? next.slice(-200) : next;
+    });
+  }, []);
+
+  const consumeSSE = async (res: Response) => {
+    if (!res.ok || !res.body) {
+      message.error('请求失败');
+      setRunning(false);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.type === 'log') {
+              appendLog(data.message);
+            } else if (data.stage) {
+              setProgress(data as FileImportProgress);
+              if (data.message) appendLog(`[${STAGE_LABELS[data.stage] || data.stage}] ${data.message}`);
+            }
+          } catch {}
+        }
+      }
+    }
+  };
+
+  const handleStart = async () => {
+    if (!file) {
+      message.warning('请先上传 URL 列表文件');
+      return;
+    }
+    setRunning(true);
+    setProgress(null);
+    setLogs([]);
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('params', JSON.stringify({ count, skip_kafka: skipKafka }));
+
+    try {
+      const res = await fetch(bffApi.fileImportUrl, {
+        method: 'POST',
+        body: formData,
+      });
+      await consumeSSE(res);
+    } catch (e: any) {
+      message.error('连接失败: ' + e.message);
+    } finally {
+      setRunning(false);
+      setCheckpoint(null);
+      if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  };
+
+  const handleResume = async () => {
+    setRunning(true);
+    setProgress(null);
+    setLogs([`正在恢复导入, 从阶段 "${STAGE_LABELS[checkpoint?.stage || ''] || checkpoint?.stage}" 继续, 已完成 ${checkpoint?.done || 0} 条...`]);
+
+    try {
+      const res = await fetch(bffApi.fileImportResumeUrl, { method: 'POST' });
+      await consumeSSE(res);
+    } catch (e: any) {
+      message.error('恢复失败: ' + e.message);
+    } finally {
+      setRunning(false);
+      setCheckpoint(null);
+      if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  };
+
+  const percent = progress && progress.total > 0
+    ? Math.round((progress.completed / progress.total) * 100)
+    : 0;
+
+  return (
+    <div style={{ maxWidth: 700 }}>
+      {checkpoint?.exists && !running && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="检测到未完成的导入任务"
+          description={`上次导入在「${STAGE_LABELS[checkpoint.stage || ''] || checkpoint.stage}」阶段中断，已完成 ${checkpoint.done?.toLocaleString()} / ${checkpoint.count?.toLocaleString()} 条。`}
+          action={
+            <Button type="primary" icon={<PlayCircleOutlined />} onClick={handleResume}>
+              继续导入
+            </Button>
+          }
+        />
+      )}
+
+      <Upload.Dragger
+        accept=".txt,.csv"
+        maxCount={1}
+        beforeUpload={(f) => { setFile(f); return false; }}
+        onRemove={() => setFile(null)}
+        style={{ marginBottom: 24 }}
+      >
+        <p className="ant-upload-drag-icon"><FileTextOutlined /></p>
+        <p className="ant-upload-text">点击或拖拽 URL 列表文件到此区域</p>
+        <p className="ant-upload-hint">支持 .txt / .csv 文件，每行一个图片 URL</p>
+      </Upload.Dragger>
+
+      <Form layout="inline" style={{ marginBottom: 16 }}>
+        <Form.Item label="导入数量">
+          <InputNumber min={1} max={10000000} value={count} onChange={(v) => setCount(v || 10000)} style={{ width: 150 }} />
+        </Form.Item>
+        <Form.Item label="跳过 Kafka">
+          <Switch checked={skipKafka} onChange={setSkipKafka} />
+        </Form.Item>
+      </Form>
+
+      <Button type="primary" loading={running} onClick={handleStart} disabled={running || !file}>
+        {running ? '导入中...' : '开始导入'}
+      </Button>
+
+      {progress && (
+        <div style={{ marginTop: 16 }}>
+          <div style={{ marginBottom: 8 }}>
+            <Tag color={progress.stage === 'error' ? 'red' : progress.stage === 'done' ? 'green' : 'blue'}>
+              {STAGE_LABELS[progress.stage] || progress.stage}
+            </Tag>
+            {progress.message}
+          </div>
+          <Progress
+            percent={percent}
+            status={progress.stage === 'error' ? 'exception' : running ? 'active' : 'success'}
+            format={() => progress.total > 0 ? `${progress.completed}/${progress.total}` : `${percent}%`}
+          />
+        </div>
+      )}
+
+      {logs.length > 0 && (
+        <pre
+          ref={logRef}
+          style={{
+            marginTop: 16,
+            maxHeight: 300,
+            overflow: 'auto',
+            background: '#1a1a1a',
+            color: '#d4d4d4',
+            padding: 12,
+            borderRadius: 6,
+            fontSize: 12,
+            lineHeight: 1.5,
+          }}
+        >
+          {logs.slice(-50).join('\n')}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 export default function ImageImport() {
   return (
     <Card title="图片导入">
@@ -178,6 +408,7 @@ export default function ImageImport() {
         items={[
           { key: 'single', label: '单图导入', children: <SingleImport /> },
           { key: 'batch', label: '批量导入 (≤128)', children: <BatchImport /> },
+          { key: 'file', label: '文件导入 (大批量)', children: <FileImport /> },
         ]}
       />
     </Card>

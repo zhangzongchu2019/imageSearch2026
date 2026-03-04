@@ -147,6 +147,15 @@ export interface BatchItemResult {
   error?: string;
 }
 
+// --- File Import Types ---
+
+export interface FileImportProgress {
+  stage: 'collect' | 'download' | 'extract' | 'milvus' | 'pg' | 'done' | 'error';
+  completed: number;
+  total: number;
+  message: string;
+}
+
 // --- Scheduler Types ---
 
 export interface SchedulerJob {
@@ -163,6 +172,39 @@ export interface JobHistory {
   status: 'success' | 'failed';
   duration_ms: number;
   error?: string;
+}
+
+// --- Service Management Types ---
+
+export interface ServiceInfo {
+  name: string;
+  state: string;
+  status: string;
+  ports: string;
+}
+
+// --- Milvus Data Browser Types ---
+
+export interface MilvusPartitionInfo {
+  name: string;
+  count: number;
+  lastUpdated?: string;
+}
+
+export interface MilvusRecord {
+  image_pk: string;
+  product_id: string;
+  is_evergreen: boolean;
+  category_l1: number;
+  category_l2: number;
+  tags: number[];
+  ts_month: number;
+  vec_dim: number | null;
+}
+
+export interface MilvusDataResponse {
+  records: MilvusRecord[];
+  total: number;
 }
 
 // --- Test Runner Types ---

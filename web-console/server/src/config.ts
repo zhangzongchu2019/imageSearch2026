@@ -8,4 +8,5 @@ export const config = {
   batchConcurrency: parseInt(process.env.BATCH_CONCURRENCY || '8'),
   uploadMaxAge: 3600_000, // 1 hour in ms
   projectRoot: process.env.PROJECT_ROOT || '/home/zzc/IdeaProjects/imageSearch2026',
+  prometheusUrl: process.env.PROMETHEUS_URL || 'http://localhost:9099',
 };

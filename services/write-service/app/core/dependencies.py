@@ -8,6 +8,7 @@ v1.3 加固:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -23,10 +24,9 @@ async def _retry_with_backoff(func, name: str, max_retries: int = 5, base_delay:
     """指数退避重试"""
     for attempt in range(max_retries + 1):
         try:
-            if asyncio.iscoroutinefunction(func):
-                result = await func()
-            else:
-                result = func()
+            result = func()
+            if inspect.isawaitable(result):
+                result = await result
             if attempt > 0:
                 logger.info("dep_connected_after_retry", name=name, attempts=attempt + 1)
             return result
@@ -72,13 +72,38 @@ class BitmapFilterPushClient:
         logger.info("bitmap_push_client_created", target=target)
 
     async def push_update(self, image_pk: str, merchant_id: str, is_evergreen: bool):
-        """直推 bitmap delta 到 bitmap-filter-service"""
-        # 简化: 发送 PushUpdateRequest (proto 已定义)
-        # 生产中应使用编译后的 pb2 stub
+        """直推 bitmap delta 到 bitmap-filter-service via gRPC unary call"""
         try:
-            # 发送轻量级 gRPC 调用
-            from google.protobuf import empty_pb2
+            # 构建序列化的 PushUpdateRequest (避免 proto 编译依赖)
+            # 使用 gRPC 通用调用 — service/method 定义与 Java 端 BitmapFilterHandler 对应
+            import grpc
+            import struct
+
+            # 手工构建简单 protobuf: field 1=image_pk, 2=merchant_id, 3=is_evergreen
+            def _encode_string(field_num: int, value: str) -> bytes:
+                data = value.encode("utf-8")
+                tag = (field_num << 3) | 2  # wire type 2 = length-delimited
+                return bytes([tag]) + bytes([len(data)]) + data
+
+            def _encode_bool(field_num: int, value: bool) -> bytes:
+                tag = (field_num << 3) | 0  # wire type 0 = varint
+                return bytes([tag, int(value)])
+
+            payload = (
+                _encode_string(1, image_pk)
+                + _encode_string(2, merchant_id)
+                + _encode_bool(3, is_evergreen)
+            )
+
+            response = await self._channel.unary_unary(
+                "/imagesearch.BitmapFilter/PushUpdate",
+                request_serializer=lambda x: x,
+                response_deserializer=lambda x: x,
+            )(payload, timeout=5.0)
+
             logger.debug("bitmap_push_sent", image_pk=image_pk, merchant_id=merchant_id)
+        except grpc.RpcError as e:
+            logger.warning("bitmap_push_rpc_error", code=e.code().name, details=e.details())
         except Exception as e:
             logger.warning("bitmap_push_error", error=str(e))
 

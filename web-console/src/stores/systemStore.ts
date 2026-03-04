@@ -40,14 +40,28 @@ export const useSystemStore = create<SystemState>((set) => ({
       const { data } = await adminApi.getDegradeStatus();
       set({ degradeStatus: data });
     } catch {
-      // silent when disconnected
+      // silent — endpoint may 500 if degrade monitor not fully initialized
     }
   },
 
   fetchBreakers: async () => {
     try {
       const { data } = await adminApi.getBreakers();
-      set({ breakers: data });
+      // Backend returns {name: {state, fail_count, ...}} object, convert to array
+      let list: BreakerInfo[];
+      if (Array.isArray(data)) {
+        list = data;
+      } else if (data && typeof data === 'object') {
+        list = Object.entries(data).map(([key, val]: [string, any]) => ({
+          name: val.name || key,
+          state: (val.state || 'closed').toLowerCase().replace('closed', 'closed').replace('open', 'open').replace('half_open', 'half_open') as BreakerInfo['state'],
+          fail_count: val.fail_count ?? 0,
+          last_state_change: val.last_state_change || '',
+        }));
+      } else {
+        list = [];
+      }
+      set({ breakers: list });
     } catch {
       // silent when disconnected
     }
@@ -56,7 +70,26 @@ export const useSystemStore = create<SystemState>((set) => ({
   fetchRateLimiter: async () => {
     try {
       const { data } = await adminApi.getRateLimiterStatus();
-      set({ rateLimiter: data });
+      // Backend returns {limiter_name: {rate_per_second, burst_limit, current_tokens, fill_percent}}
+      // Convert to our expected format
+      let status: RateLimiterStatus | null = null;
+      if (data && typeof data === 'object') {
+        if ('tokens_remaining' in data) {
+          // Already in expected format
+          status = data as RateLimiterStatus;
+        } else {
+          // Extract first limiter entry
+          const first = Object.values(data)[0] as any;
+          if (first) {
+            status = {
+              tokens_remaining: first.current_tokens ?? 0,
+              max_tokens: first.burst_limit ?? 0,
+              refill_rate: first.rate_per_second ?? 0,
+            };
+          }
+        }
+      }
+      set({ rateLimiter: status });
     } catch {
       // silent when disconnected
     }

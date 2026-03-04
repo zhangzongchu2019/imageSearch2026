@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import {
   Card, Tabs, Upload, Form, InputNumber, Select, Button, Row, Col, Tag, Descriptions,
-  Modal, Slider, Table, Progress, message, Image, Space, Typography,
+  Modal, Slider, Table, Progress, message, Image, Space, Typography, Switch,
 } from 'antd';
 import { InboxOutlined, SearchOutlined, ZoomInOutlined } from '@ant-design/icons';
 import { searchApi } from '../../api/searchApi';
@@ -11,24 +11,52 @@ import { useBatchOperation } from '../../hooks/useBatchOperation';
 import { fileToBase64, fileToDataUrl } from '../../utils/imageUtils';
 import { formatMs } from '../../utils/formatters';
 import ConfidenceBadge from '../../components/ConfidenceBadge';
+import { generateMerchantScope } from '../../utils/testData';
 import type { SearchResultItem, SearchResponse } from '../../api/types';
 
 const { Text } = Typography;
+
+const SCOPE_OPTIONS = [100, 300, 900, 2500, 5000, 10000] as const;
 
 function SingleSearch() {
   const [form] = Form.useForm();
   const [searching, setSearching] = useState(false);
   const [queryPreview, setQueryPreview] = useState<string | null>(null);
+  const [queryFile, setQueryFile] = useState<File | null>(null);
+  const [testMode, setTestMode] = useState(false);
   const { lastResponse, setLastResponse, selectedResult, setSelectedResult, setQueryImageUrl } = useSearchStore();
   const addRecord = useHistoryStore((s) => s.addRecord);
   const [compareVisible, setCompareVisible] = useState(false);
 
-  const handleSearch = async (file: File) => {
+  const handleTestModeChange = (checked: boolean) => {
+    setTestMode(checked);
+    if (checked) {
+      form.setFieldsValue({ data_scope: 'ALL' });
+    } else {
+      form.setFieldsValue({ merchant_scope: undefined, data_scope: undefined });
+    }
+  };
+
+  const fillMerchantScope = (count: number) => {
+    const ids = generateMerchantScope(count);
+    form.setFieldsValue({ merchant_scope: ids });
+  };
+
+  const handleFileSelect = async (file: File) => {
+    const dataUrl = await fileToDataUrl(file);
+    setQueryPreview(dataUrl);
+    setQueryFile(file);
+  };
+
+  const handleSearch = async () => {
+    if (!queryFile) {
+      message.warning('请先上传查询图片');
+      return;
+    }
     setSearching(true);
     try {
-      const [base64, dataUrl] = await Promise.all([fileToBase64(file), fileToDataUrl(file)]);
-      setQueryPreview(dataUrl);
-      setQueryImageUrl(dataUrl);
+      const base64 = await fileToBase64(queryFile);
+      setQueryImageUrl(queryPreview!);
       const params = form.getFieldsValue();
       const { data } = await searchApi.search({
         query_image: base64,
@@ -58,7 +86,7 @@ function SingleSearch() {
           <Upload.Dragger
             accept="image/*"
             maxCount={1}
-            beforeUpload={(file) => { handleSearch(file); return false; }}
+            beforeUpload={(file) => { handleFileSelect(file); return false; }}
             showUploadList={false}
             style={{ marginBottom: 16 }}
           >
@@ -72,7 +100,33 @@ function SingleSearch() {
             )}
           </Upload.Dragger>
 
+          <Button
+            type="primary"
+            icon={<SearchOutlined />}
+            loading={searching}
+            disabled={!queryFile}
+            onClick={handleSearch}
+            block
+            style={{ marginBottom: 16 }}
+          >
+            开始查询
+          </Button>
+
           <Form form={form} layout="vertical" initialValues={{ top_k: 20 }}>
+            <Form.Item label="测试模式" tooltip="开启后可快速填充测试商家范围">
+              <Switch checked={testMode} onChange={handleTestModeChange} />
+            </Form.Item>
+            {testMode && (
+              <Form.Item label="商家数量">
+                <Space wrap>
+                  {SCOPE_OPTIONS.map((n) => (
+                    <Button key={n} size="small" onClick={() => fillMerchantScope(n)}>
+                      {n}家
+                    </Button>
+                  ))}
+                </Space>
+              </Form.Item>
+            )}
             <Form.Item name="top_k" label="Top K">
               <InputNumber min={1} max={200} style={{ width: '100%' }} />
             </Form.Item>
@@ -190,8 +244,10 @@ function SingleSearch() {
 function BatchSearch() {
   const { progress, running, start } = useBatchOperation('/api/bff/batch/search');
   const [activeTab, setActiveTab] = useState('0');
+  const [fileList, setFileList] = useState<File[]>([]);
 
-  const handleStart = (fileList: File[]) => {
+  const handleStart = () => {
+    if (fileList.length === 0) return;
     const formData = new FormData();
     fileList.forEach((f) => formData.append('files', f));
     formData.append('params', JSON.stringify({ top_k: 20 }));
@@ -208,15 +264,24 @@ function BatchSearch() {
         maxCount={128}
         beforeUpload={() => false}
         onChange={(info) => {
-          if (info.fileList.length > 0) {
-            handleStart(info.fileList.map((f) => f.originFileObj!));
-          }
+          setFileList(info.fileList.map((f) => f.originFileObj!).filter(Boolean));
         }}
         style={{ marginBottom: 16 }}
       >
         <p className="ant-upload-drag-icon"><InboxOutlined /></p>
-        <p className="ant-upload-text">拖拽多张图片开始批量查询 (最多128张)</p>
+        <p className="ant-upload-text">拖拽多张图片到此区域 (最多128张)</p>
       </Upload.Dragger>
+
+      <Button
+        type="primary"
+        icon={<SearchOutlined />}
+        loading={running}
+        disabled={fileList.length === 0 || running}
+        onClick={handleStart}
+        style={{ marginBottom: 16 }}
+      >
+        开始批量查询 ({fileList.length} 张)
+      </Button>
 
       {progress && (
         <div>

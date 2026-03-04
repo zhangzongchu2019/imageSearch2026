@@ -1,7 +1,7 @@
 FROM python:3.11-slim AS builder
 WORKDIR /build
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --timeout 300 --retries 5 --prefix=/install -r requirements.txt
 
 FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*

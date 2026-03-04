@@ -16,7 +16,7 @@ export default function Config() {
     setLoading(true);
     try {
       const { data } = await adminApi.getConfigAudit();
-      setAuditLog(data);
+      setAuditLog(Array.isArray(data) ? data : (data as any)?.recent_changes ?? []);
     } catch (e: any) {
       message.error('获取审计日志失败: ' + e.message);
     } finally {

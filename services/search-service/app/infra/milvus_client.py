@@ -55,9 +55,11 @@ class MilvusSearchClient:
         top_k: int,
     ) -> List[Candidate]:
         """热区 HNSW 检索 — 受熔断器保护"""
+        # HNSW requires ef >= top_k
+        effective_ef = max(ef_search, top_k)
         search_params = {
             "metric_type": "COSINE",
-            "params": {"ef": ef_search},
+            "params": {"ef": effective_ef},
         }
         loop = asyncio.get_event_loop()
 

@@ -10,6 +10,7 @@ v1.3 加固:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
@@ -84,10 +85,9 @@ async def _retry_with_backoff(
     """指数退避重试 — 所有外部依赖初始化统一使用 (FIX #1)"""
     for attempt in range(max_retries + 1):
         try:
-            if asyncio.iscoroutinefunction(func):
-                result = await func()
-            else:
-                result = func()
+            result = func()
+            if inspect.isawaitable(result):
+                result = await result
             if attempt > 0:
                 logger.info(
                     "dependency_connected_after_retry",
@@ -186,7 +186,7 @@ class ServiceLifecycle:
             pg_pool=self.pg_pool, redis_client=self.redis_client
         )
         feature_extractor = FeatureExtractor()
-        refiner = Refiner(self.milvus_client)
+        refiner = Refiner(self.milvus_client, executor=self._milvus_executor)
         ranker = FusionRanker()
         scope_resolver = ScopeResolver(self.redis_client, self.pg_pool)
         vocab_cache = VocabCache(self.redis_client, self.pg_pool)

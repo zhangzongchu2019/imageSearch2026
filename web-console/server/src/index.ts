@@ -8,6 +8,8 @@ import proxyRoutes from './routes/proxy.js';
 import batchRoutes from './routes/batch.js';
 import testRoutes from './routes/tests.js';
 import schedulerRoutes from './routes/scheduler.js';
+import serviceRoutes from './routes/services.js';
+import milvusRoutes from './routes/milvus.js';
 
 const app = express();
 
@@ -24,6 +26,22 @@ app.use('/api/bff', proxyRoutes);
 app.use('/api/bff/batch', batchRoutes);
 app.use('/api/bff/tests', testRoutes);
 app.use('/api/bff/scheduler', schedulerRoutes);
+app.use('/api/bff/services', serviceRoutes);
+app.use('/api/bff/milvus', milvusRoutes);
+
+// Prometheus QPS proxy
+app.get('/api/bff/metrics/qps', async (_req, res) => {
+  try {
+    const query = 'sum(rate(http_request_duration_seconds_count[1m]))';
+    const url = `${config.prometheusUrl}/api/v1/query?query=${encodeURIComponent(query)}`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const data = await resp.json() as any;
+    const qps = parseFloat(data?.data?.result?.[0]?.value?.[1] || '0');
+    res.json({ qps: isNaN(qps) ? 0 : Math.round(qps * 100) / 100 });
+  } catch {
+    res.json({ qps: 0 });
+  }
+});
 
 // Health check
 app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));

@@ -9,7 +9,8 @@ pydantic==2.6.1
 pydantic-settings==2.1.0
 
 # Milvus
-pymilvus==2.4.0
+pymilvus==2.5.4
+marshmallow<4
 
 # Database
 asyncpg==0.29.0

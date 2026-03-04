@@ -2,13 +2,13 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --timeout 300 --retries 5 --prefix=/install -r requirements.txt
 
 FROM python:3.11-slim
 
 # 系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx libglib2.0-0 curl && \
+    libgl1 libglib2.0-0 curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Python 依赖
@@ -26,7 +26,7 @@ USER appuser
 
 # 健康检查
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
-    CMD curl -f http://localhost:8080/healthz || exit 1
+    CMD curl -f http://localhost:8080/api/v1/healthz || exit 1
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

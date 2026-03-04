@@ -1,6 +1,7 @@
 apscheduler==3.10.4
 asyncpg==0.29.0
 pymilvus==2.4.0
+marshmallow<4
 structlog==24.1.0
 pyyaml==6.0.1
 fastapi==0.111.0

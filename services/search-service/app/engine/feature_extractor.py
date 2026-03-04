@@ -104,6 +104,11 @@ class FeatureExtractor:
                 model_path=str(ONNX_MODEL_PATH),
             )
 
+        # sub-image 特征提取需要单独模型 (当前未加载)
+        # 降级行为: sub_vecs=None → pipeline._fallback 自动跳过子图召回路径
+        logger.info("sub_image_extraction_degraded",
+                     reason="sub-image model not loaded, fallback to tag-only recall")
+
     # ── 公共接口 ──
 
     async def extract_query(
@@ -170,7 +175,7 @@ class FeatureExtractor:
             global_vec=global_vec,
             tags_pred=tags_pred,
             category_l1_pred=category_l1_pred,
-            sub_vecs=None,  # TODO: sub-image 需单独模型
+            sub_vecs=None,  # sub-image 特征需单独模型, 当前降级跳过子图召回
             model_version=self._model_version,
             embedding_dim=len(global_vec),
         )

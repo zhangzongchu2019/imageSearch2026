@@ -23,6 +23,8 @@ const Breakers = lazy(() => import('./pages/Admin/Breakers'));
 const Config = lazy(() => import('./pages/Admin/Config'));
 const Tests = lazy(() => import('./pages/Admin/Tests'));
 const Scheduler = lazy(() => import('./pages/Admin/Scheduler'));
+const Services = lazy(() => import('./pages/Admin/Services'));
+const DataBrowser = lazy(() => import('./pages/Admin/DataBrowser'));
 
 export const routes: RouteObject[] = [
   { path: '/', element: wrap(Dashboard) },
@@ -34,4 +36,6 @@ export const routes: RouteObject[] = [
   { path: '/admin/config', element: wrap(Config) },
   { path: '/admin/tests', element: wrap(Tests) },
   { path: '/admin/scheduler', element: wrap(Scheduler) },
+  { path: '/admin/services', element: wrap(Services) },
+  { path: '/admin/data-browser', element: wrap(DataBrowser) },
 ];

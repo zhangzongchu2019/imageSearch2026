@@ -23,6 +23,14 @@ services:
     environment:
       <<: *common-env
       IMGSRCH_SERVER__WORKERS: 4
+      IMGSRCH_REDIS__HOST: redis
+      IMGSRCH_POSTGRES__HOST: postgres
+      IMGSRCH_POSTGRES__USER: imgsrch
+      IMGSRCH_POSTGRES__PASSWORD: imgsrch_pass
+      IMGSRCH_MILVUS__HOST: milvus-standalone
+      IMGSRCH_KAFKA__BOOTSTRAP_SERVERS: kafka:9092
+      IMGSRCH_BITMAP_FILTER__HOST: bitmap-filter-service
+      IMGSRCH_ALLOW_MOCK_INFERENCE: "true"
     deploy:
       replicas: 2
       resources:
@@ -131,6 +139,8 @@ services:
       BATCH_MAX_SIZE: "128"
       BATCH_CONCURRENCY: "8"
       PROJECT_ROOT: /project
+      PROMETHEUS_URL: http://prometheus:9090
+      PG_DSN: postgresql://imgsrch:imgsrch_pass@postgres:5432/image_search
     volumes:
       - .:/project:ro
     depends_on:
@@ -140,7 +150,7 @@ services:
   prometheus:
     image: prom/prometheus:v2.51.0
     ports:
-      - "9090:9090"
+      - "9099:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -197,24 +207,28 @@ services:
     image: confluentinc/cp-kafka:7.6.0
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_NODE_ID: 1
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      CLUSTER_ID: "imgsrch-kafka-cluster-01"
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: "kCBSfKTLQhqL7JrLTEfoHA"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     volumes:
       - kafka-data:/var/lib/kafka/data
 
   milvus-standalone:
-    image: milvusdb/milvus:v2.4.0
+    image: milvusdb/milvus:v2.5.4
+    command: ["milvus", "run", "standalone"]
     ports:
       - "19530:19530"
+      - "9091:9091"
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
@@ -235,6 +249,8 @@ services:
 
   minio:
     image: minio/minio:latest
+    ports:
+      - "9001:9001"
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin

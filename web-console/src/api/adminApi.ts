@@ -14,27 +14,27 @@ export const adminApi = {
     return client.get<SystemStatus>('/api/v1/system/status');
   },
   getDegradeStatus() {
-    return client.get<DegradeStatus>('/admin/degrade/status');
+    return client.get<DegradeStatus>('/api/v1/admin/degrade/status');
   },
   overrideDegrade(state: DegradeState, reason: string) {
-    return client.post('/admin/degrade/override', { state, reason });
+    return client.post('/api/v1/admin/degrade/override', { state, reason });
   },
   releaseDegrade() {
-    return client.post('/admin/degrade/release');
+    return client.post('/api/v1/admin/degrade/release');
   },
   getBreakers() {
-    return client.get<BreakerInfo[]>('/admin/breakers');
+    return client.get<BreakerInfo[]>('/api/v1/admin/breakers');
   },
   forceBreaker(name: string, state: BreakerState) {
-    return client.post(`/admin/breakers/${name}/force`, { state });
+    return client.post(`/api/v1/admin/breakers/${name}/force`, { state });
   },
   getRateLimiterStatus() {
-    return client.get<RateLimiterStatus>('/admin/rate_limiter/status');
+    return client.get<RateLimiterStatus>('/api/v1/admin/rate_limiter/status');
   },
   reloadConfig() {
-    return client.post('/admin/config/reload');
+    return client.post('/api/v1/admin/config/reload');
   },
   getConfigAudit() {
-    return client.get<ConfigAuditEntry[]>('/admin/config/audit');
+    return client.get<ConfigAuditEntry[]>('/api/v1/admin/config/audit');
   },
 };

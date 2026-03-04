@@ -1,0 +1,7 @@
+Place service configuration YAML files here.
+
+Expected files:
+  - search_config.yml  (optional overrides for app/core/config.py defaults)
+
+These files are copied into the Docker image at build time.
+Environment variables take precedence over config file values.

@@ -7,6 +7,7 @@ import {
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { usePolling } from '../../hooks/usePolling';
 import { useSystemStore } from '../../stores/systemStore';
+import { bffApi } from '../../api/bffApi';
 import type { DegradeState, BreakerState } from '../../api/types';
 
 const { Title, Text } = Typography;
@@ -57,20 +58,33 @@ export default function Dashboard() {
   usePolling(() => {
     fetchAll();
     if (connected) {
-      setMetrics((prev) => {
-        const now = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        const next = [...prev, {
-          time: now,
-          p99: degradeStatus?.window_metrics?.p99_ms ?? 0,
-          qps: Math.random() * 100,
-          errors: degradeStatus?.window_metrics?.error_rate ?? 0,
-        }];
-        return next.slice(-60);
+      bffApi.getPrometheusQps().then(({ data }) => {
+        setMetrics((prev) => {
+          const now = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          const next = [...prev, {
+            time: now,
+            p99: degradeStatus?.window_metrics?.p99_ms ?? 0,
+            qps: data.qps ?? 0,
+            errors: degradeStatus?.window_metrics?.error_rate ?? 0,
+          }];
+          return next.slice(-60);
+        });
+      }).catch(() => {
+        setMetrics((prev) => {
+          const now = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          const next = [...prev, {
+            time: now,
+            p99: degradeStatus?.window_metrics?.p99_ms ?? 0,
+            qps: 0,
+            errors: degradeStatus?.window_metrics?.error_rate ?? 0,
+          }];
+          return next.slice(-60);
+        });
       });
     }
   }, 5000);
 
-  const isHealthy = status?.status === 'ok' || status?.status === 'healthy';
+  const isHealthy = status?.status === 'ok' || status?.status === 'healthy' || status?.status === 'serving';
 
   return (
     <div>

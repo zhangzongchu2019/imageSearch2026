@@ -1,0 +1,7 @@
+Place service configuration files here.
+
+Expected files:
+  - write_config.yml  (optional overrides for default settings)
+
+These files are copied into the Docker image at build time.
+Environment variables take precedence over config file values.

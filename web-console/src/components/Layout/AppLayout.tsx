@@ -12,6 +12,8 @@ import {
   ThunderboltOutlined,
   ApiOutlined,
   KeyOutlined,
+  CloudServerOutlined,
+  DatabaseOutlined,
 } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
 import { useAuthStore } from '../../stores/authStore';
@@ -33,6 +35,8 @@ const menuItems: MenuProps['items'] = [
       { key: '/admin/config', icon: <SettingOutlined />, label: '配置管理' },
       { key: '/admin/tests', icon: <ExperimentOutlined />, label: '测试运行' },
       { key: '/admin/scheduler', icon: <ClockCircleOutlined />, label: '任务调度' },
+      { key: '/admin/services', icon: <CloudServerOutlined />, label: '服务管理' },
+      { key: '/admin/data-browser', icon: <DatabaseOutlined />, label: '数据浏览' },
     ],
   },
 ];

@@ -15,6 +15,7 @@ export default defineConfig({
       '/api/bff': {
         target: 'http://localhost:3001',
         changeOrigin: true,
+        timeout: 0, // no timeout for large uploads + SSE
       },
       '/uploads': {
         target: 'http://localhost:3001',
