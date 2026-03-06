@@ -400,7 +400,7 @@ class ServiceLifecycle:
         return pool
 
     async def _init_milvus(self):
-        from pymilvus import connections
+        from pymilvus import connections, utility
 
         cfg = settings.milvus
         cs = get_config_service()
@@ -410,7 +410,100 @@ class ServiceLifecycle:
 
         connections.connect(alias="default", host=host, port=port, token=token)
         logger.info("milvus_connected", host=host)
+
+        # 自动初始化: 检测 collections 是否存在, 不存在则自动创建
+        required = [cfg.hot_collection, cfg.non_hot_collection, cfg.sub_collection]
+        missing = [c for c in required if not utility.has_collection(c)]
+        if missing:
+            logger.warning("milvus_collections_missing", missing=missing)
+            self._ensure_milvus_collections(cfg)
+
         return connections
+
+    @staticmethod
+    def _ensure_milvus_collections(cfg):
+        """首次启动时自动创建 Milvus collections + 索引 + 分区"""
+        from datetime import datetime, timedelta, timezone
+        from pymilvus import (
+            Collection, CollectionSchema, FieldSchema, DataType, utility,
+        )
+
+        def _create_global(name: str, index_type: str):
+            if utility.has_collection(name):
+                return
+            fields = [
+                FieldSchema("image_pk", DataType.VARCHAR, is_primary=True, max_length=32),
+                FieldSchema("global_vec", DataType.FLOAT_VECTOR, dim=256),
+                FieldSchema("category_l1", DataType.INT32),
+                FieldSchema("category_l2", DataType.INT32),
+                FieldSchema("category_l3", DataType.INT32),
+                FieldSchema("tags", DataType.ARRAY, element_type=DataType.INT32, max_capacity=32),
+                FieldSchema("color_code", DataType.INT32),
+                FieldSchema("material_code", DataType.INT32),
+                FieldSchema("style_code", DataType.INT32),
+                FieldSchema("season_code", DataType.INT32),
+                FieldSchema("is_evergreen", DataType.BOOL),
+                FieldSchema("ts_month", DataType.INT32),
+                FieldSchema("promoted_at", DataType.INT64),
+                FieldSchema("product_id", DataType.VARCHAR, max_length=64),
+                FieldSchema("created_at", DataType.INT64),
+            ]
+            schema = CollectionSchema(fields, description=f"Image search {name}")
+            coll = Collection(name, schema)
+
+            if index_type == "HNSW":
+                idx = {"metric_type": "COSINE", "index_type": "HNSW",
+                       "params": {"M": 24, "efConstruction": 200}}
+            else:
+                idx = {"metric_type": "COSINE", "index_type": "DISKANN", "params": {}}
+            coll.create_index("global_vec", idx)
+
+            for f in ["category_l1", "category_l2", "category_l3",
+                       "color_code", "material_code", "style_code",
+                       "season_code", "ts_month", "is_evergreen"]:
+                coll.create_index(f, {"index_type": "INVERTED"})
+            coll.create_index("tags", {"index_type": "INVERTED"})
+
+            now = datetime.now(timezone.utc)
+            for offset in range(-2, 4):
+                dt = now.replace(day=1) + timedelta(days=32 * offset)
+                try:
+                    coll.create_partition(f"p_{dt.strftime('%Y%m')}")
+                except Exception:
+                    pass
+            try:
+                coll.create_partition("p_999999")
+            except Exception:
+                pass
+
+            coll.load()
+            logger.info("milvus_collection_auto_created", name=name, index=index_type)
+
+        def _create_sub():
+            name = cfg.sub_collection
+            if utility.has_collection(name):
+                return
+            fields = [
+                FieldSchema("sub_pk", DataType.VARCHAR, is_primary=True, max_length=48),
+                FieldSchema("image_pk", DataType.VARCHAR, max_length=32),
+                FieldSchema("sub_vec", DataType.FLOAT_VECTOR, dim=128),
+                FieldSchema("bbox", DataType.VARCHAR, max_length=64),
+                FieldSchema("confidence", DataType.FLOAT),
+                FieldSchema("ts_month", DataType.INT32),
+                FieldSchema("is_evergreen", DataType.BOOL),
+            ]
+            schema = CollectionSchema(fields, description="Sub-image vectors")
+            coll = Collection(name, schema)
+            coll.create_index("sub_vec", {"metric_type": "COSINE", "index_type": "IVF_FLAT",
+                                          "params": {"nlist": 128}})
+            coll.create_index("ts_month", {"index_type": "INVERTED"})
+            coll.create_index("is_evergreen", {"index_type": "INVERTED"})
+            coll.load()
+            logger.info("milvus_collection_auto_created", name=name, index="IVF_FLAT")
+
+        _create_global(cfg.hot_collection, "HNSW")
+        _create_global(cfg.non_hot_collection, "DISKANN")
+        _create_sub()
 
     async def _init_kafka(self):
         from aiokafka import AIOKafkaProducer

@@ -9,4 +9,6 @@ export const config = {
   uploadMaxAge: 3600_000, // 1 hour in ms
   projectRoot: process.env.PROJECT_ROOT || '/home/zzc/IdeaProjects/imageSearch2026',
   prometheusUrl: process.env.PROMETHEUS_URL || 'http://localhost:9099',
+  // Internal URL base for uploaded files — reachable from other containers via Docker network
+  uploadUrlBase: process.env.UPLOAD_URL_BASE || `http://web-console:3000`,
 };

@@ -19,7 +19,7 @@ RUN npx tsc || true
 
 # Stage 3: Production
 FROM node:20-alpine
-RUN apk add --no-cache nginx
+RUN apk add --no-cache nginx docker-cli docker-cli-compose
 
 WORKDIR /app
 

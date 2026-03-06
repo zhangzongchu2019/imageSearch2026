@@ -32,7 +32,6 @@ services:
       IMGSRCH_BITMAP_FILTER__HOST: bitmap-filter-service
       IMGSRCH_ALLOW_MOCK_INFERENCE: "true"
     deploy:
-      replicas: 2
       resources:
         limits:
           memory: 8G
@@ -56,8 +55,8 @@ services:
       - "8081:8081"
     environment:
       <<: *common-env
+      IMGSRCH_ALLOW_MOCK_INFERENCE: "true"
     deploy:
-      replicas: 2
       resources:
         limits:
           memory: 4G
@@ -80,7 +79,6 @@ services:
     volumes:
       - bitmap-rocksdb:/data/rocksdb
     deploy:
-      replicas: 2
       resources:
         limits:
           memory: 16G
@@ -141,8 +139,13 @@ services:
       PROJECT_ROOT: /project
       PROMETHEUS_URL: http://prometheus:9090
       PG_DSN: postgresql://imgsrch:imgsrch_pass@postgres:5432/image_search
+      MILVUS_HOST: milvus-standalone
+      MILVUS_PORT: "19530"
+      DOCKER_COMPOSE_V2: "true"
+      COMPOSE_PROJECT_NAME: imagesearch2026
     volumes:
       - .:/project:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     depends_on:
       - search-service
       - write-service

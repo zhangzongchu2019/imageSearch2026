@@ -9,6 +9,7 @@
     "build": "tsc"
   },
   "dependencies": {
+    "@zilliz/milvus2-sdk-node": "^2.6.10",
     "axios": "^1.7.0",
     "cors": "^2.8.5",
     "express": "^4.19.0",

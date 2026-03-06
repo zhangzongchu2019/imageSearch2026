@@ -59,10 +59,10 @@ class TestDownloadImage:
         assert data == good_resp.content
 
     @pytest.mark.asyncio
-    async def test_size_limit_10mb(self):
-        """超过 10MB 返回 400"""
+    async def test_size_limit_25mb(self):
+        """超过 25MB 返回 400"""
         mock_resp = MagicMock()
-        mock_resp.content = b"\x00" * (10 * 1024 * 1024 + 1)
+        mock_resp.content = b"\x00" * (25 * 1024 * 1024 + 1)
         mock_resp.raise_for_status = MagicMock()
 
         ctx_factory, _ = _make_async_client_mock(get_return_value=mock_resp)
@@ -71,7 +71,7 @@ class TestDownloadImage:
             with pytest.raises(HTTPException) as exc_info:
                 await _download_image("https://example.com/big.jpg")
         assert exc_info.value.status_code == 400
-        assert "10MB" in str(exc_info.value.detail)
+        assert "25MB" in str(exc_info.value.detail)
 
     @pytest.mark.asyncio
     async def test_all_retries_exhausted(self):

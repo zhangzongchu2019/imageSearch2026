@@ -13,8 +13,12 @@ const { Dragger } = Upload;
 const { TextArea } = Input;
 
 const categories = [
-  'clothing', 'shoes', 'bags', 'accessories', 'electronics',
-  'home', 'beauty', 'food', 'sports', 'toys',
+  { label: '服装', value: '服装' },
+  { label: '鞋靴', value: '鞋靴' },
+  { label: '经典箱包', value: '经典箱包' },
+  { label: '家具', value: '家具' },
+  { label: '珠宝', value: '珠宝' },
+  { label: '数码', value: '数码' },
 ];
 
 function SingleImport() {
@@ -31,7 +35,7 @@ function SingleImport() {
       form.setFieldsValue({
         merchant_id: randomMerchantId(),
         product_id: randomProductId(),
-        category_l1: 'clothing',
+        category_l1: '服装',
       });
     } else {
       form.setFieldsValue({ merchant_id: undefined, product_id: undefined, category_l1: undefined });
@@ -90,7 +94,7 @@ function SingleImport() {
           <Input placeholder="merchant_001" />
         </Form.Item>
         <Form.Item name="category_l1" label="一级分类" rules={[{ required: true }]}>
-          <Select options={categories.map((c) => ({ label: c, value: c }))} placeholder="选择分类" />
+          <Select options={categories} placeholder="选择分类" />
         </Form.Item>
         <Form.Item name="product_id" label="商品 ID" rules={[{ required: true }]}>
           <Input placeholder="prod_12345" />
@@ -128,7 +132,7 @@ function BatchImport() {
       form.setFieldsValue({
         merchant_id: randomMerchantId(),
         product_id: randomProductId(),
-        category_l1: 'clothing',
+        category_l1: '服装',
       });
     } else {
       form.setFieldsValue({ merchant_id: undefined, product_id: undefined, category_l1: undefined });
@@ -219,7 +223,10 @@ const STAGE_LABELS: Record<string, string> = {
 
 function FileImport() {
   const [file, setFile] = useState<File | null>(null);
-  const [count, setCount] = useState(10000);
+  const [startLine, setStartLine] = useState(1);
+  const [endLine, setEndLine] = useState(10000);
+  const [concurrency, setConcurrency] = useState(8);
+  const [retries, setRetries] = useState(2);
   const [skipKafka, setSkipKafka] = useState(true);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<FileImportProgress | null>(null);
@@ -241,7 +248,9 @@ function FileImport() {
 
   const consumeSSE = async (res: Response) => {
     if (!res.ok || !res.body) {
-      message.error('请求失败');
+      let detail = `HTTP ${res.status}`;
+      try { detail = (await res.text()) || detail; } catch {}
+      message.error(`请求失败: ${detail}`);
       setRunning(false);
       return;
     }
@@ -283,7 +292,7 @@ function FileImport() {
 
     const formData = new FormData();
     formData.append('file', file);
-    formData.append('params', JSON.stringify({ count, skip_kafka: skipKafka }));
+    formData.append('params', JSON.stringify({ start: startLine, end: endLine, concurrency, retries, skip_kafka: skipKafka }));
 
     try {
       const res = await fetch(bffApi.fileImportUrl, {
@@ -350,9 +359,18 @@ function FileImport() {
         <p className="ant-upload-hint">支持 .txt / .csv 文件，每行一个图片 URL</p>
       </Upload.Dragger>
 
-      <Form layout="inline" style={{ marginBottom: 16 }}>
-        <Form.Item label="导入数量">
-          <InputNumber min={1} max={10000000} value={count} onChange={(v) => setCount(v || 10000)} style={{ width: 150 }} />
+      <Form layout="inline" style={{ marginBottom: 16, gap: '8px 0', flexWrap: 'wrap' }}>
+        <Form.Item label="起始行">
+          <InputNumber min={1} max={10000000} value={startLine} onChange={(v) => setStartLine(v || 1)} style={{ width: 120 }} />
+        </Form.Item>
+        <Form.Item label="结束行">
+          <InputNumber min={1} max={10000000} value={endLine} onChange={(v) => setEndLine(v || 10000)} style={{ width: 120 }} />
+        </Form.Item>
+        <Form.Item label="并行数">
+          <InputNumber min={1} max={64} value={concurrency} onChange={(v) => setConcurrency(v || 8)} style={{ width: 80 }} />
+        </Form.Item>
+        <Form.Item label="重试次数">
+          <InputNumber min={0} max={10} value={retries} onChange={(v) => setRetries(v ?? 2)} style={{ width: 80 }} />
         </Form.Item>
         <Form.Item label="跳过 Kafka">
           <Switch checked={skipKafka} onChange={setSkipKafka} />

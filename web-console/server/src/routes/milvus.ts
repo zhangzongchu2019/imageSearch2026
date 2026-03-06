@@ -1,61 +1,51 @@
 import { Router } from 'express';
-import { execFile } from 'child_process';
+import { MilvusClient } from '@zilliz/milvus2-sdk-node';
 
 const router = Router();
 
-const MILVUS_HOST = process.env.MILVUS_HOST || 'localhost';
-const MILVUS_PORT = process.env.MILVUS_PORT || '19530';
+const MILVUS_ADDRESS = `${process.env.MILVUS_HOST || 'localhost'}:${process.env.MILVUS_PORT || '19530'}`;
 const COLLECTION = 'global_images_hot';
 
-function runPython(script: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile('python3', ['-c', script], { timeout: 30_000 }, (err, stdout, stderr) => {
-      if (err) {
-        reject(new Error(stderr || err.message));
-      } else {
-        resolve(stdout);
-      }
-    });
-  });
+async function withMilvus<T>(fn: (client: MilvusClient) => Promise<T>): Promise<T> {
+  const client = new MilvusClient({ address: MILVUS_ADDRESS });
+  try {
+    await client.connectPromise;
+    return await fn(client);
+  } finally {
+    await client.closeConnection().catch(() => {});
+  }
 }
 
 // GET /partitions — list partitions with counts
 router.get('/partitions', async (_req, res) => {
-  const script = `
-import json
-from pymilvus import connections, Collection
-
-connections.connect(host="${MILVUS_HOST}", port=${MILVUS_PORT})
-coll = Collection("${COLLECTION}")
-coll.flush()
-
-result = []
-for p in coll.partitions:
-    info = {"name": p.name, "count": p.num_entities}
-    # try to get last updated time from PG uri_dedup
-    try:
-        import subprocess, os as _os
-        pg_dsn = _os.environ.get("PG_DSN", "postgresql://imgsrch:imgsrch_pass@localhost:5432/image_search")
-        r = subprocess.run(
-            ["psql", "-t", "-A", "-c",
-             f"SELECT max(created_at) FROM uri_dedup WHERE ts_month = (SELECT max(ts_month) FROM uri_dedup)",
-             pg_dsn],
-            capture_output=True, text=True, timeout=5
-        )
-        val = r.stdout.strip()
-        if val and val != "":
-            info["lastUpdated"] = val
-    except Exception:
-        pass
-    result.append(info)
-
-connections.disconnect("default")
-print(json.dumps(result))
-`;
   try {
-    const out = await runPython(script);
-    res.json(JSON.parse(out));
+    const result = await withMilvus(async (client) => {
+      await client.flushSync({ collection_names: [COLLECTION] });
+      const showRes = await client.showPartitions({ collection_name: COLLECTION });
+      const partitions = showRes.data || [];
+
+      // Get row count for each partition
+      const items = await Promise.all(
+        partitions.map(async (p: any) => {
+          let count = 0;
+          try {
+            const stats = await client.getPartitionStatistics({
+              collection_name: COLLECTION,
+              partition_name: p.name,
+            });
+            const rowCountStat = (stats.stats || []).find((s: any) => s.key === 'row_count');
+            count = rowCountStat ? Number(rowCountStat.value) : 0;
+          } catch {
+            // ignore stats error
+          }
+          return { name: p.name, count };
+        })
+      );
+      return items;
+    });
+    res.json(result);
   } catch (e: any) {
+    console.error('[milvus] /partitions error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -71,53 +61,58 @@ router.get('/data', async (req, res) => {
     return;
   }
 
-  // Sanitize partition name (only allow alphanumeric and underscore)
   if (!/^[a-zA-Z0-9_]+$/.test(partition)) {
     res.status(400).json({ error: 'invalid partition name' });
     return;
   }
 
-  const script = `
-import json
-from pymilvus import connections, Collection
-
-connections.connect(host="${MILVUS_HOST}", port=${MILVUS_PORT})
-coll = Collection("${COLLECTION}")
-coll.load(partition_names=["${partition}"])
-
-fields = ["image_pk", "product_id", "is_evergreen", "category_l1", "category_l2", "tags", "ts_month"]
-rows = coll.query(
-    expr="image_pk != ''",
-    partition_names=["${partition}"],
-    output_fields=fields,
-    limit=${limit},
-    offset=${offset},
-)
-
-# Get partition count
-total = 0
-for p in coll.partitions:
-    if p.name == "${partition}":
-        total = p.num_entities
-        break
-
-# Get vector dimension
-vec_dim = None
-for f in coll.schema.fields:
-    if f.name == "global_vec":
-        vec_dim = f.params.get("dim", None)
-        break
-
-for r in rows:
-    r["vec_dim"] = vec_dim
-
-connections.disconnect("default")
-print(json.dumps({"records": rows, "total": total}))
-`;
   try {
-    const out = await runPython(script);
-    res.json(JSON.parse(out));
+    const result = await withMilvus(async (client) => {
+      const fields = ['image_pk', 'product_id', 'is_evergreen', 'category_l1', 'category_l2', 'tags', 'ts_month'];
+
+      const queryRes = await client.query({
+        collection_name: COLLECTION,
+        partition_names: [partition],
+        expr: "image_pk != ''",
+        output_fields: fields,
+        limit,
+        offset,
+      });
+
+      // Get partition count
+      let total = 0;
+      try {
+        const stats = await client.getPartitionStatistics({
+          collection_name: COLLECTION,
+          partition_name: partition,
+        });
+        const rowCountStat = (stats.stats || []).find((s: any) => s.key === 'row_count');
+        total = rowCountStat ? Number(rowCountStat.value) : 0;
+      } catch {
+        // ignore
+      }
+
+      // Get vector dimension from schema
+      const desc = await client.describeCollection({ collection_name: COLLECTION });
+      let vecDim: number | null = null;
+      for (const f of desc.schema?.fields || []) {
+        if (f.name === 'global_vec') {
+          const dimParam = (f.type_params || []).find((tp: any) => tp.key === 'dim');
+          vecDim = dimParam ? Number(dimParam.value) : null;
+          break;
+        }
+      }
+
+      const records = (queryRes.data || []).map((r: any) => ({
+        ...r,
+        vec_dim: vecDim,
+      }));
+
+      return { records, total };
+    });
+    res.json(result);
   } catch (e: any) {
+    console.error('[milvus] /data error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });

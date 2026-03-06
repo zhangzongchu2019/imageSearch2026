@@ -36,7 +36,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
     res.status(400).json({ message: 'No file uploaded' });
     return;
   }
-  const url = `http://localhost:${config.port}/uploads/${req.file.filename}`;
+  const url = `${config.uploadUrlBase}/uploads/${req.file.filename}`;
   res.json({ url, filename: req.file.filename });
 });
 
@@ -48,7 +48,7 @@ router.post('/upload/multi', upload.array('files', 128), (req, res) => {
     return;
   }
   const results = files.map((f) => ({
-    url: `http://localhost:${config.port}/uploads/${f.filename}`,
+    url: `${config.uploadUrlBase}/uploads/${f.filename}`,
     filename: f.filename,
     originalName: f.originalname,
   }));

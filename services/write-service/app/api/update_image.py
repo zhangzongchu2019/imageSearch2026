@@ -240,7 +240,13 @@ async def _process_new_image(deps, image_pk: str, req: UpdateImageRequest, trace
             "image_pk": image_pk,
             "global_vec": features.global_vec,
             "category_l1": cat_l1_code,
-            "tags": tag_codes,
+            "category_l2": 0,
+            "category_l3": 0,
+            "tags": tag_codes if tag_codes else [0],
+            "color_code": 0,
+            "material_code": 0,
+            "style_code": 0,
+            "season_code": 0,
             "is_evergreen": is_evergreen,
             "ts_month": ts_month,
             "promoted_at": promoted_at,
@@ -386,17 +392,17 @@ async def _write_compensation_log(redis_client, key: str, data: dict):
         logger.error("compensation_log_write_failed", error=str(e))
 
 
-async def _download_image(uri: str, timeout: float = 3.0, retries: int = 2) -> bytes:
+async def _download_image(uri: str, timeout: float = 10.0, retries: int = 3) -> bytes:
     """下载图片, 指数退避重试"""
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=False, follow_redirects=True) as client:
         for attempt in range(retries + 1):
             try:
                 resp = await client.get(uri, headers={"User-Agent": "SZWEGO-ImageSearch/1.2"})
                 resp.raise_for_status()
                 data = resp.content
-                if len(data) > 10 * 1024 * 1024:
+                if len(data) > 25 * 1024 * 1024:
                     raise HTTPException(status_code=400, detail={
-                        "error": {"code": "200_01_02", "message": "Image exceeds 10MB"}
+                        "error": {"code": "200_01_02", "message": "Image exceeds 25MB"}
                     })
                 return data
             except httpx.HTTPError as e:
@@ -404,7 +410,7 @@ async def _download_image(uri: str, timeout: float = 3.0, retries: int = 2) -> b
                     raise HTTPException(status_code=400, detail={
                         "error": {"code": "200_01_04", "message": f"Image download failed: {e}"}
                     })
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(1.5 ** attempt)
     raise RuntimeError("unreachable")
 
 

@@ -3,11 +3,11 @@ import multer from 'multer';
 import { v4 as uuid } from 'uuid';
 import path from 'path';
 import fs from 'fs';
-import { spawn } from 'child_process';
 import readline from 'readline';
 import { config } from '../config.js';
 import { orchestrateBatchImport } from '../services/batchOrchestrator.js';
 import { searchClient } from '../services/searchClient.js';
+import { writeClient } from '../services/writeClient.js';
 
 const router = Router();
 
@@ -27,7 +27,7 @@ router.post('/import', upload.array('files', 128), async (req, res) => {
   const meta = JSON.parse(req.body.metadata || '{}');
 
   const items = (files || []).map((f) => ({
-    url: `http://localhost:${config.port}/uploads/${f.filename}`,
+    url: `${config.uploadUrlBase}/uploads/${f.filename}`,
     merchant_id: meta.merchant_id || '',
     category_l1: meta.category_l1 || '',
     product_id: meta.product_id || '',
@@ -99,10 +99,10 @@ router.post('/search', upload.array('files', 128), async (req, res) => {
   res.end();
 });
 
-// File import — spawn Python script with SSE progress
+// File import — read URL list and call write-service API for each
 const txtUpload = multer({ storage, limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB
 
-router.post('/file-import', txtUpload.single('file'), (req, res) => {
+router.post('/file-import', txtUpload.single('file'), async (req, res) => {
   // Disable timeouts for long-running import
   req.socket.setTimeout(0);
   req.socket.setKeepAlive(true);
@@ -114,8 +114,10 @@ router.post('/file-import', txtUpload.single('file'), (req, res) => {
   }
 
   const params = JSON.parse(req.body.params || '{}');
-  const count = String(params.count || 10000);
-  const skipKafka = params.skip_kafka ?? true;
+  const startLine = Math.max(1, params.start || 1);          // 1-based
+  const endLine = params.end || 10000000;
+  const concurrency = Math.min(64, Math.max(1, params.concurrency || config.batchConcurrency));
+  const maxRetries = Math.min(10, Math.max(0, params.retries ?? 2));
 
   // SSE headers
   res.writeHead(200, {
@@ -124,78 +126,153 @@ router.post('/file-import', txtUpload.single('file'), (req, res) => {
     Connection: 'keep-alive',
   });
 
-  const scriptPath = path.resolve(config.projectRoot, 'scripts', 'batch_import_clothing.py');
-  const args = [
-    scriptPath,
-    '--url-file', file.path,
-    '--count', count,
-  ];
-  if (skipKafka) {
-    args.push('--skip-kafka');
-  }
-
-  const checkpointFile = path.join(config.uploadDir, 'batch_import_checkpoint.json');
-  const child = spawn('python3', args, {
-    env: { ...process.env, CHECKPOINT_FILE: checkpointFile },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  const rl = readline.createInterface({ input: child.stdout });
-  const rlErr = readline.createInterface({ input: child.stderr });
-
   const sendSSE = (data: object) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
   };
 
-  rl.on('line', (line) => {
-    if (line.startsWith('##PROGRESS##')) {
+  let aborted = false;
+  req.on('close', () => { aborted = true; });
+
+  try {
+    // 1) Read URLs from file — stream, then slice [startLine, endLine]
+    sendSSE({ stage: 'collect', completed: 0, total: 0, message: '正在读取 URL 列表...' });
+    const allUrls: string[] = await new Promise((resolve, reject) => {
+      const lines: string[] = [];
+      const rl = readline.createInterface({ input: fs.createReadStream(file.path, 'utf-8'), crlfDelay: Infinity });
+      rl.on('line', (line) => {
+        const trimmed = line.trim();
+        if (trimmed) lines.push(trimmed);
+      });
+      rl.on('close', () => resolve(lines));
+      rl.on('error', reject);
+    });
+    // Slice by line range (1-based inclusive)
+    const urls = allUrls.slice(startLine - 1, endLine);
+    const total = urls.length;
+
+    if (total === 0) {
+      sendSSE({ stage: 'error', completed: 0, total: 0, message: '文件中没有有效的 URL' });
+      res.write('event: done\ndata: {}\n\n');
+      res.end();
+      fs.unlink(file.path, () => {});
+      return;
+    }
+
+    sendSSE({ stage: 'collect', completed: 0, total, message: `文件共 ${allUrls.length} 行，选取第 ${startLine}~${startLine + total - 1} 行，共 ${total} 条 URL` });
+    sendSSE({ type: 'log', message: `将处理 ${total} 条 URL（并行 ${concurrency}，重试 ${maxRetries} 次）` });
+
+    // 2) Process URLs in batches via write-service API
+    let completed = 0;
+    let succeeded = 0;
+    let failed = 0;
+    const apiKey = req.headers['x-api-key'] as string | undefined;
+
+    // Save checkpoint for resume
+    const checkpointFile = path.join(config.uploadDir, 'batch_import_checkpoint.json');
+    const saveCheckpoint = () => {
       try {
-        const json = JSON.parse(line.slice('##PROGRESS##'.length));
-        sendSSE(json);
-      } catch {
-        sendSSE({ type: 'log', message: line });
+        fs.writeFileSync(checkpointFile, JSON.stringify({
+          exists: true,
+          stage: 'milvus',
+          done: completed,
+          count: total,
+          succeeded,
+          failed,
+          url_file: file.path,
+          skip_kafka: params.skip_kafka ?? true,
+        }));
+      } catch {}
+    };
+
+    // Helper: call write-service with retries
+    const importOne = async (url: string): Promise<{ success: boolean; image_id?: string; error?: string }> => {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          const resp = await writeClient.post(
+            '/api/v1/image/update',
+            {
+              uri: url,
+              merchant_id: `auto_${Date.now()}`,
+              category_l1: '服装',
+              product_id: `file_import_${completed}`,
+            },
+            {
+              headers: apiKey ? { 'X-API-Key': apiKey } : {},
+              timeout: 30000,
+            },
+          );
+          return { success: true, image_id: resp.data.image_id };
+        } catch (e: any) {
+          if (attempt < maxRetries) {
+            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+          const msg = e.response?.data?.detail?.error?.message || e.response?.data?.message || e.message;
+          return { success: false, error: msg };
+        }
       }
-    } else {
-      sendSSE({ type: 'log', message: line });
-    }
-  });
+      return { success: false, error: 'unreachable' };
+    };
 
-  rlErr.on('line', (line) => {
-    sendSSE({ type: 'log', message: line });
-  });
+    for (let i = 0; i < total && !aborted; i += concurrency) {
+      const batch = urls.slice(i, i + concurrency);
+      const promises = batch.map(async (url) => {
+        const result = await importOne(url);
+        if (result.success) {
+          succeeded++;
+        } else {
+          failed++;
+          sendSSE({ type: 'log', message: `[失败] ${url}: ${result.error}` });
+        }
+        completed++;
+        return result;
+      });
 
-  child.on('close', (code) => {
-    if (code === 0) {
-      sendSSE({ stage: 'done', completed: 0, total: 0, message: 'Import completed successfully' });
-    } else {
-      sendSSE({ stage: 'error', completed: 0, total: 0, message: `Process exited with code ${code}` });
+      await Promise.allSettled(promises);
+
+      // Send progress
+      const stage = completed >= total ? 'done' : 'milvus';
+      sendSSE({
+        stage,
+        completed,
+        total,
+        message: `已处理 ${completed}/${total} (成功 ${succeeded}, 失败 ${failed})`,
+      });
+
+      // Save checkpoint every batch
+      if (completed % (concurrency * 5) === 0) {
+        saveCheckpoint();
+      }
     }
-    // Always clean up uploaded file (checkpoint handles resume, not the raw file)
+
+    // Final
+    if (aborted) {
+      saveCheckpoint();
+      sendSSE({ type: 'log', message: '导入被中断，已保存断点' });
+    } else {
+      sendSSE({ stage: 'done', completed, total, message: `导入完成: 成功 ${succeeded}, 失败 ${failed}` });
+      sendSSE({ type: 'log', message: `导入完成！共 ${total} 条，成功 ${succeeded}，失败 ${failed}` });
+      // Clean up checkpoint on success
+      try { fs.unlinkSync(checkpointFile); } catch {}
+    }
+  } catch (e: any) {
+    sendSSE({ stage: 'error', completed: 0, total: 0, message: `导入失败: ${e.message}` });
+    sendSSE({ type: 'log', message: `错误: ${e.stack || e.message}` });
+  } finally {
     fs.unlink(file.path, () => {});
     res.write('event: done\ndata: {}\n\n');
     res.end();
-  });
-
-  child.on('error', (err) => {
-    sendSSE({ stage: 'error', completed: 0, total: 0, message: err.message });
-    res.write('event: done\ndata: {}\n\n');
-    res.end();
-  });
-
-  req.on('close', () => {
-    child.kill('SIGTERM');
-  });
+  }
 });
 
 // Resume import from checkpoint
-router.post('/file-import/resume', (_req, res) => {
+router.post('/file-import/resume', async (_req, res) => {
   const checkpointPath = path.join(config.uploadDir, 'batch_import_checkpoint.json');
   if (!fs.existsSync(checkpointPath)) {
     res.status(404).json({ message: 'No checkpoint found' });
     return;
   }
 
-  // Disable timeouts
   _req.socket.setTimeout(0);
   _req.socket.setKeepAlive(true);
 
@@ -205,73 +282,79 @@ router.post('/file-import/resume', (_req, res) => {
     Connection: 'keep-alive',
   });
 
-  const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, 'utf-8'));
-
-  const scriptPath = path.resolve(config.projectRoot, 'scripts', 'batch_import_clothing.py');
-  const args = [
-    scriptPath,
-    '--resume',
-    '--count', String(checkpoint.count || 10000),
-    '--download-dir', checkpoint.download_dir || '/tmp/clothing_images',
-  ];
-  if (checkpoint.url_file) {
-    args.push('--url-file', checkpoint.url_file);
-  }
-  if (checkpoint.model_path) {
-    args.push('--model-path', checkpoint.model_path);
-  }
-  if (checkpoint.skip_kafka) {
-    args.push('--skip-kafka');
-  }
-
-  const child = spawn('python3', args, {
-    env: { ...process.env, CHECKPOINT_FILE: checkpointPath },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  const rl = readline.createInterface({ input: child.stdout });
-  const rlErr = readline.createInterface({ input: child.stderr });
-
   const sendSSE = (data: object) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
   };
 
-  rl.on('line', (line) => {
-    if (line.startsWith('##PROGRESS##')) {
-      try {
-        const json = JSON.parse(line.slice('##PROGRESS##'.length));
-        sendSSE(json);
-      } catch {
-        sendSSE({ type: 'log', message: line });
-      }
-    } else {
-      sendSSE({ type: 'log', message: line });
-    }
-  });
+  try {
+    const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, 'utf-8'));
+    const urlFile = checkpoint.url_file;
 
-  rlErr.on('line', (line) => {
-    sendSSE({ type: 'log', message: line });
-  });
-
-  child.on('close', (code) => {
-    if (code === 0) {
-      sendSSE({ stage: 'done', completed: 0, total: 0, message: 'Import resumed and completed' });
-    } else {
-      sendSSE({ stage: 'error', completed: 0, total: 0, message: `Process exited with code ${code}` });
+    if (!urlFile || !fs.existsSync(urlFile)) {
+      sendSSE({ stage: 'error', completed: 0, total: 0, message: 'URL 文件已丢失，无法恢复' });
+      res.write('event: done\ndata: {}\n\n');
+      res.end();
+      return;
     }
+
+    const maxCount = checkpoint.count || 10000;
+    const startFrom = checkpoint.done || 0;
+    const urls: string[] = await new Promise((resolve, reject) => {
+      const lines: string[] = [];
+      const rl = readline.createInterface({ input: fs.createReadStream(urlFile, 'utf-8'), crlfDelay: Infinity });
+      rl.on('line', (line) => {
+        const trimmed = line.trim();
+        if (trimmed && lines.length < maxCount) lines.push(trimmed);
+      });
+      rl.on('close', () => resolve(lines));
+      rl.on('error', reject);
+    });
+    const remaining = urls.slice(startFrom);
+    const total = urls.length;
+
+    sendSSE({ stage: 'milvus', completed: startFrom, total, message: `从第 ${startFrom + 1} 条恢复导入...` });
+
+    let completed = startFrom;
+    let succeeded = checkpoint.succeeded || 0;
+    let failed = checkpoint.failed || 0;
+    let aborted = false;
+    _req.on('close', () => { aborted = true; });
+
+    const concurrency = config.batchConcurrency;
+    const apiKey = _req.headers['x-api-key'] as string | undefined;
+
+    for (let i = 0; i < remaining.length && !aborted; i += concurrency) {
+      const batch = remaining.slice(i, i + concurrency);
+      const promises = batch.map(async (url) => {
+        try {
+          await writeClient.post('/api/v1/image/update', {
+            uri: url,
+            merchant_id: `auto_${Date.now()}`,
+            category_l1: '服装',
+            product_id: `file_import_${completed}`,
+          }, { timeout: 30000 });
+          succeeded++;
+        } catch (e: any) {
+          failed++;
+          const msg = e.response?.data?.detail?.error?.message || e.message;
+          sendSSE({ type: 'log', message: `[失败] ${url}: ${msg}` });
+        } finally {
+          completed++;
+        }
+      });
+
+      await Promise.allSettled(promises);
+      sendSSE({ stage: completed >= total ? 'done' : 'milvus', completed, total, message: `已处理 ${completed}/${total} (成功 ${succeeded}, 失败 ${failed})` });
+    }
+
+    sendSSE({ stage: 'done', completed, total, message: `恢复导入完成: 成功 ${succeeded}, 失败 ${failed}` });
+    try { fs.unlinkSync(checkpointPath); } catch {}
+  } catch (e: any) {
+    sendSSE({ stage: 'error', completed: 0, total: 0, message: `恢复失败: ${e.message}` });
+  } finally {
     res.write('event: done\ndata: {}\n\n');
     res.end();
-  });
-
-  child.on('error', (err) => {
-    sendSSE({ stage: 'error', completed: 0, total: 0, message: err.message });
-    res.write('event: done\ndata: {}\n\n');
-    res.end();
-  });
-
-  _req.on('close', () => {
-    child.kill('SIGTERM');
-  });
+  }
 });
 
 // Check if a resume checkpoint exists
