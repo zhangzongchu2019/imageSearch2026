@@ -1,8 +1,8 @@
 """
-inference-service — CLIP ViT-B/32 特征提取微服务
+inference-service — CLIP ViT-B/32 特征提取微服务 (GPU FP16)
 
 供 write-service（导入时）和 search-service（查询时）共同调用。
-输出 256 维 L2 归一化向量，匹配 Milvus schema。
+输出 256 维 L2 归一化向量（FP32），匹配 Milvus schema。
 """
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ import asyncio
 import base64
 import io
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import os
+import threading
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -26,18 +27,25 @@ EMBEDDING_DIM = 256
 # Global state filled at startup
 _model = None
 _preprocess = None
-_projection: np.ndarray | None = None  # 512 → 256 线性投影
-_infer_pool: ThreadPoolExecutor | None = None  # 推理线程池
-
+_projection: torch.Tensor | None = None  # 512 → 256 投影矩阵 (GPU)
+_device: torch.device = torch.device("cpu")
+_lock = threading.Lock()  # GPU 序列化锁
 
 MODEL_PATH = "/models/ViT-B-32.pt"
 
 
 def _load_model():
     """加载 CLIP ViT-B/32 并初始化投影矩阵"""
-    global _model, _preprocess, _projection
+    global _model, _preprocess, _projection, _device
     import open_clip
-    import os
+
+    # 选择设备
+    if torch.cuda.is_available():
+        _device = torch.device("cuda")
+        logger.info("Using GPU: %s", torch.cuda.get_device_name(0))
+    else:
+        _device = torch.device("cpu")
+        logger.info("GPU not available, falling back to CPU")
 
     # PyTorch 2.6+ 默认 weights_only=True，与 CLIP TorchScript 格式不兼容
     _orig_torch_load = torch.load
@@ -54,28 +62,37 @@ def _load_model():
         model, _, preprocess = open_clip.create_model_and_transforms(
             "ViT-B-32", pretrained="openai"
         )
+    torch.load = _orig_torch_load
+
     model.eval()
-    torch.load = _orig_torch_load  # 恢复原始 torch.load
+    model = model.to(_device)
+
+    # GPU FP16 半精度 — 推理速度翻倍，显存减半
+    if _device.type == "cuda":
+        model = model.half()
+        logger.info("Model converted to FP16")
+
     _model = model
     _preprocess = preprocess
 
-    # 固定随机种子生成投影矩阵（512 → 256），确保所有实例一致
+    # 投影矩阵 (512 → 256)，固定种子确保所有实例一致
     rng = np.random.RandomState(42)
     proj = rng.randn(512, EMBEDDING_DIM).astype(np.float32)
-    # 正交化以保持距离关系
     u, _, vt = np.linalg.svd(proj, full_matrices=False)
-    _projection = u  # (512, 256) 正交矩阵
+    _projection = torch.from_numpy(u).to(_device)  # (512, 256)
+    if _device.type == "cuda":
+        _projection = _projection.half()
 
-    logger.info("CLIP ViT-B/32 loaded, projection matrix initialized (512 → %d)", EMBEDDING_DIM)
+    logger.info(
+        "CLIP ViT-B/32 loaded on %s, projection matrix initialized (512 → %d)",
+        _device, EMBEDDING_DIM,
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _infer_pool
     _load_model()
-    _infer_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="infer")
     yield
-    _infer_pool.shutdown(wait=False)
 
 
 app = FastAPI(title="inference-service", lifespan=lifespan)
@@ -92,17 +109,24 @@ class ExtractResponse(BaseModel):
 
 
 def _do_inference(image_bytes: bytes) -> list[float]:
-    """CPU 推理 — 在线程池中执行，不阻塞事件循环"""
+    """GPU FP16 推理 — 通过锁序列化 GPU 访问"""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img_tensor = _preprocess(img).unsqueeze(0)  # (1, 3, 224, 224)
-    with torch.no_grad():
-        features = _model.encode_image(img_tensor)  # (1, 512)
-    vec_512 = features[0].cpu().numpy().astype(np.float32)
-    vec_256 = vec_512 @ _projection
-    norm = np.linalg.norm(vec_256)
+    img_tensor = _preprocess(img).unsqueeze(0).to(_device)  # (1, 3, 224, 224)
+
+    if _device.type == "cuda":
+        img_tensor = img_tensor.half()
+
+    with _lock:
+        with torch.no_grad():
+            features = _model.encode_image(img_tensor)  # (1, 512)
+
+    # 投影 + L2 归一化，全程 GPU 计算
+    vec_256 = (features[0] @ _projection).float()  # → FP32
+    norm = torch.linalg.norm(vec_256)
     if norm > 0:
         vec_256 = vec_256 / norm
-    return vec_256.tolist()
+
+    return vec_256.cpu().numpy().tolist()
 
 
 @app.post("/api/v1/extract", response_model=ExtractResponse)
@@ -113,7 +137,7 @@ async def extract(req: ExtractRequest):
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
     loop = asyncio.get_running_loop()
-    global_vec = await loop.run_in_executor(_infer_pool, _do_inference, image_bytes)
+    global_vec = await loop.run_in_executor(None, _do_inference, image_bytes)
 
     return ExtractResponse(
         global_vec=global_vec,
@@ -126,7 +150,7 @@ async def extract(req: ExtractRequest):
 async def healthz():
     if _model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    return {"status": "ok"}
+    return {"status": "ok", "device": str(_device)}
 
 
 if __name__ == "__main__":

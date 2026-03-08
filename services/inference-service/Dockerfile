@@ -1,20 +1,10 @@
-FROM python:3.11-slim
+FROM nvcr.io/nvidia/pytorch:25.02-py3
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy pre-downloaded wheel files and requirements
-COPY torch-*.whl torchvision-*.whl /tmp/wheels/
+# Install dependencies (torch/torchvision already in base image)
 COPY requirements.txt .
-
-# Install PyTorch from local wheels, then the rest
-RUN pip install --no-cache-dir /tmp/wheels/*.whl \
-    && pip install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt \
-    && rm -rf /tmp/wheels
+RUN pip install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
 # Copy CLIP model
 COPY ViT-B-32.pt /models/ViT-B-32.pt
