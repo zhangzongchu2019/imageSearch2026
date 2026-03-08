@@ -101,8 +101,7 @@ class DegradeStateMachine:
         self._epoch = 0
         self._instance_id = instance_id or f"pod-{id(self):x}"
 
-        # P0-B: 启动时从 Redis 同步状态
-        self._sync_from_redis()
+        # P0-B: 启动时的 Redis 同步延迟到首次 tick 执行
 
     @property
     def state(self) -> DegradeState:
@@ -125,12 +124,12 @@ class DegradeStateMachine:
             "redis_connected": self._redis is not None,
         }
 
-    def _sync_from_redis(self):
+    async def _sync_from_redis(self):
         """从 Redis 读取权威状态, 本地同步"""
         if not self._redis:
             return
         try:
-            raw = self._redis.get(self.REDIS_KEY)
+            raw = await self._redis.get(self.REDIS_KEY)
             if raw:
                 data = json.loads(raw)
                 remote_state = DegradeState(data["state"])
@@ -152,7 +151,7 @@ class DegradeStateMachine:
         except Exception as e:
             logger.warning("degrade_redis_sync_failed", error=str(e))
 
-    def _cas_transition(self, new_state: DegradeState, reason: str = "") -> bool:
+    async def _cas_transition(self, new_state: DegradeState, reason: str = "") -> bool:
         """CAS 写入 Redis — 只有 epoch 匹配时才成功
 
         Returns: True if transition accepted, False if rejected (stale epoch)
@@ -186,14 +185,14 @@ class DegradeStateMachine:
             end
             return 0
             """
-            result = self._redis.eval(lua_cas, 1, self.REDIS_KEY, new_data, str(self._epoch))
+            result = await self._redis.eval(lua_cas, 1, self.REDIS_KEY, new_data, str(self._epoch))
             if result == 1:
                 self._do_local_transition(new_state, reason, new_epoch)
                 return True
             else:
                 # CAS 失败: 其他实例已更新, 重新同步
                 logger.info("degrade_cas_rejected", attempted=new_state.value, local_epoch=self._epoch)
-                self._sync_from_redis()
+                await self._sync_from_redis()
                 return False
         except Exception as e:
             logger.warning("degrade_cas_redis_error", error=str(e))
@@ -265,12 +264,12 @@ class DegradeStateMachine:
 
         return params
 
-    def tick(self, current_p99_ms: float, current_error_rate: float):
+    async def tick(self, current_p99_ms: float, current_error_rate: float):
         """每秒调用, 检查状态转移 — P0-B: 先同步 Redis, 再 CAS 转移"""
         self._window.push(current_p99_ms, current_error_rate)
 
         # P0-B: 每次 tick 先从 Redis 同步最新状态
-        self._sync_from_redis()
+        await self._sync_from_redis()
 
         with self._lock:
             now = time.monotonic()
@@ -278,38 +277,38 @@ class DegradeStateMachine:
 
             if self._state == DegradeState.S0:
                 if self._should_enter_s2():
-                    self._cas_transition(DegradeState.S2, "p99_or_error_s2_threshold")
+                    await self._cas_transition(DegradeState.S2, "p99_or_error_s2_threshold")
                 elif self._should_enter_s1():
-                    self._cas_transition(DegradeState.S1, "p99_or_error_s1_threshold")
+                    await self._cas_transition(DegradeState.S1, "p99_or_error_s1_threshold")
 
             elif self._state == DegradeState.S1:
                 if self._should_enter_s2():
-                    self._cas_transition(DegradeState.S2, "s1_escalate_to_s2")
+                    await self._cas_transition(DegradeState.S2, "s1_escalate_to_s2")
                 elif (
                     dwell_s >= settings.degrade.recovery.s1_dwell_s
                     and self._recovery_ok()
                 ):
-                    self._cas_transition(DegradeState.S3, "s1_recovery_start")
+                    await self._cas_transition(DegradeState.S3, "s1_recovery_start")
 
             elif self._state == DegradeState.S2:
                 if (
                     dwell_s >= settings.degrade.recovery.s2_dwell_s
                     and self._recovery_ok()
                 ):
-                    self._cas_transition(DegradeState.S3, "s2_recovery_start")
+                    await self._cas_transition(DegradeState.S3, "s2_recovery_start")
 
             elif self._state == DegradeState.S3:
                 if self._should_enter_s2():
-                    self._cas_transition(DegradeState.S2, "s3_rollback_to_s2")
+                    await self._cas_transition(DegradeState.S2, "s3_rollback_to_s2")
                 elif dwell_s >= settings.degrade.recovery.s3_observe_s:
                     self._advance_ramp()
 
-    def force_state(self, state: DegradeState, reason: str = ""):
+    async def force_state(self, state: DegradeState, reason: str = ""):
         """人工覆盖 / 自动触发 (管理接口 / P0-C bitmap 联动)
         P0-B: 通过 CAS 写入 Redis, 所有实例同步
         """
         with self._lock:
-            self._cas_transition(state, reason=reason or "force_override")
+            await self._cas_transition(state, reason=reason or "force_override")
 
     def _should_enter_s1(self) -> bool:
         """FIX #13: 阈值优先从配置服务读取, 支持运行时动态调整"""

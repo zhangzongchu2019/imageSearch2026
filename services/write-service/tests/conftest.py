@@ -80,7 +80,24 @@ def mock_bitmap_push_client():
 
 
 @pytest.fixture
-def mock_deps(mock_redis, mock_pg, mock_kafka, mock_milvus, mock_vocab, mock_bitmap_push_client):
+def mock_inference_client():
+    """Mock inference service httpx client"""
+    client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {
+        "global_vec": [0.1] * 256,
+        "tags_pred": [10, 20, 30],
+        "category_l1_pred": 5,
+    }
+    client.post.return_value = mock_response
+    client.aclose = AsyncMock()
+    return client
+
+
+@pytest.fixture
+def mock_deps(mock_redis, mock_pg, mock_kafka, mock_milvus, mock_vocab, mock_bitmap_push_client, mock_inference_client):
     """Complete mock dependencies dict"""
     return {
         "pg": mock_pg,
@@ -91,4 +108,5 @@ def mock_deps(mock_redis, mock_pg, mock_kafka, mock_milvus, mock_vocab, mock_bit
         "instance_id": "test-instance-001",
         "bitmap_push_client": mock_bitmap_push_client,
         "milvus_executor": None,
+        "inference_client": mock_inference_client,
     }

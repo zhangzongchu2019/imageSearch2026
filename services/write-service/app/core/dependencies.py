@@ -157,6 +157,18 @@ async def init_dependencies() -> dict:
     # 有界线程池 for Milvus
     milvus_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="milvus-write")
 
+    # 远程推理服务 httpx 客户端 — 支持多实例轮询
+    import httpx
+    inference_urls_str = os.getenv("INFERENCE_SERVICE_URLS") or os.getenv("INFERENCE_SERVICE_URL") or ""
+    inference_urls = [u.strip() for u in inference_urls_str.split(",") if u.strip()]
+    inference_clients = []
+    if inference_urls:
+        for url in inference_urls:
+            inference_clients.append(httpx.AsyncClient(timeout=120.0))
+        logger.info("inference_clients_created", urls=inference_urls, count=len(inference_clients))
+    else:
+        logger.error("INFERENCE_SERVICE_URL(S) not set — feature extraction will fail")
+
     return {
         "pg": pg,
         "redis": redis_client,
@@ -166,6 +178,9 @@ async def init_dependencies() -> dict:
         "instance_id": INSTANCE_ID,
         "bitmap_push_client": bitmap_push_client,
         "milvus_executor": milvus_executor,
+        "inference_client": inference_clients[0] if inference_clients else None,
+        "inference_clients": inference_clients,
+        "inference_urls": inference_urls,
     }
 
 
@@ -197,6 +212,12 @@ async def _init_milvus(milvus_host: str):
 
 
 async def close_dependencies(deps: dict):
+    # 推理服务 httpx 客户端 (多实例)
+    for client in deps.get("inference_clients", []):
+        try:
+            await client.aclose()
+        except Exception:
+            pass
     # gRPC push client
     if deps.get("bitmap_push_client"):
         try:

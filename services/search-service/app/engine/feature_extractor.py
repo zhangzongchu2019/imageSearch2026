@@ -1,11 +1,9 @@
 """
-特征提取引擎 — ONNX Runtime 生产推理 + TensorRT 可选加速
+特征提取引擎 — 远程推理服务 / ONNX Runtime 本地推理
 
-P0 修复:
-  - 生产环境必须加载真实模型 (ONNX .onnx 文件), 否则启动失败
-  - 开发环境可用 IMGSRCH_ALLOW_MOCK_INFERENCE=true 启用 mock
-  - 查询侧 / 写入侧同模型、同归一化、同维度
-  - 模型元信息 (版本号/embedding_dim/归一化方式) 记录到日志与 Prometheus
+优先级:
+  1. 远程推理服务 (INFERENCE_SERVICE_URL) — 生产环境推荐
+  2. 本地 ONNX Runtime (需要 .onnx 模型文件)
 
 协议:
   - 输入: RGB 224×224, ImageNet 归一化
@@ -32,6 +30,12 @@ from app.core.metrics import METRICS
 logger = structlog.get_logger(__name__)
 settings = get_settings()
 
+# 远程推理服务 URL (优先级最高, 支持多实例)
+INFERENCE_SERVICE_URL = os.getenv("INFERENCE_SERVICE_URL")
+_INFERENCE_SERVICE_URLS = [
+    u.strip() for u in (os.getenv("INFERENCE_SERVICE_URLS") or os.getenv("INFERENCE_SERVICE_URL") or "").split(",") if u.strip()
+]
+
 # 模型常量 — 必须与训练侧一致
 EMBEDDING_DIM = 256
 TAG_VOCAB_SIZE = 1000
@@ -45,8 +49,6 @@ MODEL_DIR = Path(os.getenv("IMGSRCH_MODEL_DIR", "/models"))
 ONNX_MODEL_PATH = MODEL_DIR / "backbone_fp32.onnx"
 TENSORRT_ENGINE_PATH = MODEL_DIR / "backbone_fp16.engine"
 
-# 允许 mock 推理 (仅开发/测试环境)
-ALLOW_MOCK = os.getenv("IMGSRCH_ALLOW_MOCK_INFERENCE", "false").lower() == "true"
 
 
 class FeatureResult:
@@ -85,24 +87,28 @@ class FeatureExtractor:
         self._trt_engine = None
         self._model_version = "unknown"
         self._cpu_semaphore = asyncio.Semaphore(10)
+        self._use_remote = bool(INFERENCE_SERVICE_URL)
+        self._http_clients: list = []
+        self._http_client = None
+        self._rr_counter = 0
 
-        # 尝试加载模型
-        self._ort_session = self._load_onnx()
-        if self._ort_session:
-            self._validate_model_outputs()
-
-        # 如果既无 ONNX 也无 mock 权限 → 启动失败
-        if self._ort_session is None and not ALLOW_MOCK:
-            raise RuntimeError(
-                f"No inference model found at {ONNX_MODEL_PATH}. "
-                f"Set IMGSRCH_ALLOW_MOCK_INFERENCE=true for dev/testing."
+        if self._use_remote:
+            logger.info(
+                "REMOTE_INFERENCE_ENABLED",
+                urls=_INFERENCE_SERVICE_URLS,
+                count=len(_INFERENCE_SERVICE_URLS),
             )
-
-        if self._ort_session is None and ALLOW_MOCK:
-            logger.warning(
-                "MOCK_INFERENCE_ENABLED — 随机向量, 仅用于开发/测试",
-                model_path=str(ONNX_MODEL_PATH),
-            )
+        else:
+            # 尝试加载本地模型
+            self._ort_session = self._load_onnx()
+            if self._ort_session:
+                self._validate_model_outputs()
+            else:
+                raise RuntimeError(
+                    f"No inference backend available. "
+                    f"Set INFERENCE_SERVICE_URL for remote inference, "
+                    f"or provide ONNX model at {ONNX_MODEL_PATH}."
+                )
 
         # sub-image 特征提取需要单独模型 (当前未加载)
         # 降级行为: sub_vecs=None → pipeline._fallback 自动跳过子图召回路径
@@ -115,12 +121,13 @@ class FeatureExtractor:
         self, query_image_b64: str, device: str = "gpu"
     ) -> FeatureResult:
         """查询侧特征提取"""
+        # 优先使用远程推理服务
+        if self._use_remote:
+            return await self._remote_infer(query_image_b64)
+
         img_bytes = base64.b64decode(query_image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         tensor = self._preprocess(img)
-
-        if self._ort_session is None:
-            return self._mock_infer(tensor, include_sub=False)
 
         loop = asyncio.get_event_loop()
         if device == "gpu":
@@ -134,11 +141,41 @@ class FeatureExtractor:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         tensor = self._preprocess(img)
 
-        if self._ort_session is None:
-            return self._mock_infer(tensor, include_sub=True)
-
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._onnx_infer, tensor, True)
+
+    # ── 远程推理 ──
+
+    async def _remote_infer(self, image_b64: str) -> FeatureResult:
+        """调用远程 inference-service 获取特征向量 — 多实例轮询"""
+        import httpx
+
+        # 懒初始化多个 httpx 客户端
+        if not self._http_clients:
+            for _ in _INFERENCE_SERVICE_URLS:
+                self._http_clients.append(httpx.AsyncClient(timeout=120.0))
+
+        # Round-robin
+        idx = self._rr_counter % len(self._http_clients)
+        self._rr_counter += 1
+        client = self._http_clients[idx]
+        url = _INFERENCE_SERVICE_URLS[idx]
+
+        resp = await client.post(
+            f"{url}/api/v1/extract",
+            json={"image_b64": image_b64},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        return FeatureResult(
+            global_vec=data["global_vec"],
+            tags_pred=data.get("tags_pred", []),
+            category_l1_pred=data.get("category_l1_pred", 0),
+            sub_vecs=None,
+            model_version="clip-vit-b-32-remote",
+            embedding_dim=len(data["global_vec"]),
+        )
 
     # ── 预处理 ──
 
@@ -178,33 +215,6 @@ class FeatureExtractor:
             sub_vecs=None,  # sub-image 特征需单独模型, 当前降级跳过子图召回
             model_version=self._model_version,
             embedding_dim=len(global_vec),
-        )
-
-    # ── Mock 推理 (开发环境) ──
-
-    def _mock_infer(self, tensor: np.ndarray, include_sub: bool) -> FeatureResult:
-        """Mock 推理 — 仅在 ALLOW_MOCK=true 时可达"""
-        # 基于输入 tensor 的 hash 生成确定性向量 (同图同向量)
-        seed = int(np.abs(tensor).sum() * 1e6) % (2**31)
-        rng = np.random.RandomState(seed)
-
-        global_vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
-        global_vec = (global_vec / np.linalg.norm(global_vec)).tolist()
-
-        sub_vecs = None
-        if include_sub:
-            sub_vecs = []
-            for i in range(3):
-                sv = rng.randn(128).astype(np.float32)
-                sub_vecs.append((sv / np.linalg.norm(sv)).tolist())
-
-        return FeatureResult(
-            global_vec=global_vec,
-            tags_pred=rng.choice(TAG_VOCAB_SIZE, 5, replace=False).tolist(),
-            category_l1_pred=int(rng.randint(0, CAT_L1_SIZE)),
-            sub_vecs=sub_vecs,
-            model_version="mock-v0",
-            embedding_dim=EMBEDDING_DIM,
         )
 
     # ── 模型加载 ──

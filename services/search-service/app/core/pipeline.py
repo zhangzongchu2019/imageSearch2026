@@ -116,6 +116,7 @@ class SearchPipeline:
         scope_resolver,     # ScopeResolver
         vocab_cache,        # VocabCache
         search_logger,      # SearchLogEmitter
+        pg_pool=None,       # asyncpg Pool for URI lookup
     ):
         self._degrade = degrade_fsm
         self._feature = feature_extractor
@@ -126,6 +127,7 @@ class SearchPipeline:
         self._scope = scope_resolver
         self._vocab = vocab_cache
         self._logger = search_logger
+        self._pg_pool = pg_pool
 
         # P0-C: bitmap 连续跳过计数器
         self._bitmap_skip_consecutive = 0
@@ -264,7 +266,7 @@ class SearchPipeline:
                 pass  # 终极兜底失败仍返回空结果
 
         # ── Stage 8: 响应构建 ──
-        response = self._build_response(ctx, all_candidates, params, features)
+        response = await self._build_response(ctx, all_candidates, params, features)
 
         # 异步写搜索日志
         asyncio.create_task(
@@ -281,7 +283,14 @@ class SearchPipeline:
     # ── 内部方法 ──
 
     async def _extract_features(self, query_image_b64: str) -> FeatureResult:
-        """GPU 推理, 30ms 超时后降级 CPU (10 QPS 限流)"""
+        """特征提取 — 远程推理服务 / GPU / CPU fallback"""
+        # 远程推理模式: 超时更宽松 (网络 + 模型推理)
+        if self._feature._use_remote:
+            return await asyncio.wait_for(
+                self._feature.extract_query(query_image_b64),
+                timeout=30.0,
+            )
+        # 本地 GPU 推理, 30ms 超时后降级 CPU (10 QPS 限流)
         try:
             return await asyncio.wait_for(
                 self._feature.extract_query(query_image_b64, device="gpu"),
@@ -477,9 +486,26 @@ class SearchPipeline:
         non_hot_start = month_subtract(now, settings.non_hot_zone.months_end)
         return f"ts_month >= {non_hot_start} and ts_month < {hot_start} and is_evergreen == false"
 
+    # ── URI 查询 ──
+
+    async def _batch_fetch_uris(self, image_pks: List[str]) -> Dict[str, str]:
+        """从 PG uri_dedup 批量获取 image_pk → uri 映射"""
+        if not image_pks or self._pg_pool is None:
+            return {}
+        try:
+            async with self._pg_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT image_pk, uri FROM uri_dedup WHERE image_pk = ANY($1::char(32)[])",
+                    image_pks,
+                )
+            return {row["image_pk"].strip(): row["uri"] for row in rows if row["uri"]}
+        except Exception as e:
+            logger.warning("batch_fetch_uris_failed", error=str(e))
+            return {}
+
     # ── 响应构建 ──
 
-    def _build_response(
+    async def _build_response(
         self,
         ctx: PipelineContext,
         candidates: List[Candidate],
@@ -487,19 +513,27 @@ class SearchPipeline:
         features: FeatureResult,
     ) -> SearchResponse:
         top_k = min(params.top_k, len(candidates))
+        final_candidates = candidates[:top_k]
+
+        # 批量查询 image_url
+        uri_map = await self._batch_fetch_uris(
+            [c.image_pk for c in final_candidates]
+        )
+
         results = []
-        for i, c in enumerate(candidates[:top_k]):
+        for i, c in enumerate(final_candidates):
             results.append(
                 SearchResultItem(
                     image_id=c.image_pk,
                     score=round(c.score, 4),
+                    image_url=uri_map.get(c.image_pk),
                     product_id=c.product_id,
                     position=i + 1,
                     is_evergreen=c.is_evergreen,
                     category_l1=self._vocab.decode("category_l1", c.category_l1)
                     if c.category_l1 is not None
                     else None,
-                    tags=[self._vocab.decode("tag", t) for t in (c.tags or [])],
+                    tags=[s for t in (c.tags or []) if t is not None for s in [self._vocab.decode("tag", t)] if s is not None],
                 )
             )
 

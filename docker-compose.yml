@@ -16,6 +16,54 @@ x-common-env: &common-env
 services:
   # ── 应用服务 ──
 
+  inference-service-1:
+    build: ./services/inference-service
+    ports:
+      - "8090:8090"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "4"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  inference-service-2:
+    build: ./services/inference-service
+    ports:
+      - "8092:8090"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "4"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  inference-service-3:
+    build: ./services/inference-service
+    ports:
+      - "8093:8090"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "4"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
   search-service:
     build: ./services/search-service
     ports:
@@ -30,7 +78,8 @@ services:
       IMGSRCH_MILVUS__HOST: milvus-standalone
       IMGSRCH_KAFKA__BOOTSTRAP_SERVERS: kafka:9092
       IMGSRCH_BITMAP_FILTER__HOST: bitmap-filter-service
-      IMGSRCH_ALLOW_MOCK_INFERENCE: "true"
+      INFERENCE_SERVICE_URL: http://inference-service-1:8090
+      INFERENCE_SERVICE_URLS: http://inference-service-1:8090,http://inference-service-2:8090,http://inference-service-3:8090
     deploy:
       resources:
         limits:
@@ -43,6 +92,8 @@ services:
         condition: service_healthy
       milvus-standalone:
         condition: service_started
+      inference-service-1:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 10s
@@ -55,7 +106,8 @@ services:
       - "8081:8081"
     environment:
       <<: *common-env
-      IMGSRCH_ALLOW_MOCK_INFERENCE: "true"
+      INFERENCE_SERVICE_URL: http://inference-service-1:8090
+      INFERENCE_SERVICE_URLS: http://inference-service-1:8090,http://inference-service-2:8090,http://inference-service-3:8090
     deploy:
       resources:
         limits:
@@ -64,6 +116,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      inference-service-1:
         condition: service_healthy
 
   bitmap-filter-service:

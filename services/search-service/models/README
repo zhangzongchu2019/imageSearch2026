@@ -4,5 +4,5 @@ Expected files:
   - backbone_fp32.onnx   (required for production inference, CLIP ViT-B/32 → 256-dim)
   - backbone_fp16.engine  (optional TensorRT FP16 engine for GPU acceleration)
 
-Without these files, set IMGSRCH_ALLOW_MOCK_INFERENCE=true for dev/testing.
+Without these files, set INFERENCE_SERVICE_URL to use the remote inference-service instead.
 The Dockerfile copies this directory into the image at /models/.

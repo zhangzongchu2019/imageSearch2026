@@ -7,8 +7,8 @@ import time
 
 import pytest
 
-# 必须在 import schemas 前设置环境变量
-os.environ["IMGSRCH_ALLOW_MOCK_INFERENCE"] = "true"
+# 使用远程推理服务 (测试中 mock HTTP 调用)
+os.environ["INFERENCE_SERVICE_URL"] = "http://inference-test:8090"
 
 
 class TestTimeRangeV40:
@@ -79,26 +79,26 @@ class TestDegradeV40:
 
 
 class TestFeatureExtractorP0:
-    """P0-3: 特征提取不再返回随机向量"""
+    """P0-3: 特征提取 — 远程推理或本地 ONNX"""
 
-    def test_mock_requires_env_flag(self):
-        """无 ALLOW_MOCK=true 且无模型文件 → 启动失败"""
-        old = os.environ.get("IMGSRCH_ALLOW_MOCK_INFERENCE")
-        os.environ["IMGSRCH_ALLOW_MOCK_INFERENCE"] = "false"
+    def test_no_backend_raises_error(self):
+        """无 INFERENCE_SERVICE_URL 且无 ONNX 模型 → 启动失败"""
+        old_url = os.environ.pop("INFERENCE_SERVICE_URL", None)
         os.environ["IMGSRCH_MODEL_DIR"] = "/nonexistent"
 
-        with pytest.raises(RuntimeError, match="No inference model"):
-            from importlib import reload
-            import app.engine.feature_extractor as fe
-            reload(fe)
-            fe.FeatureExtractor()
+        try:
+            with pytest.raises(RuntimeError, match="No inference backend"):
+                from importlib import reload
+                import app.engine.feature_extractor as fe
+                reload(fe)
+                fe.FeatureExtractor()
+        finally:
+            if old_url:
+                os.environ["INFERENCE_SERVICE_URL"] = old_url
 
-        if old:
-            os.environ["IMGSRCH_ALLOW_MOCK_INFERENCE"] = old
-
-    def test_mock_deterministic(self):
-        """Mock 模式: 同图同向量 (基于内容 hash)"""
-        os.environ["IMGSRCH_ALLOW_MOCK_INFERENCE"] = "true"
+    def test_remote_inference_enabled(self):
+        """INFERENCE_SERVICE_URL 设置时使用远程推理"""
+        os.environ["INFERENCE_SERVICE_URL"] = "http://inference-test:8090"
         os.environ["IMGSRCH_MODEL_DIR"] = "/nonexistent"
 
         from importlib import reload
@@ -106,30 +106,7 @@ class TestFeatureExtractorP0:
         reload(fe)
         extractor = fe.FeatureExtractor()
 
-        import asyncio
-        import base64
-        import io
-        from PIL import Image
-        # 创建有效的 PNG 图片
-        img = Image.new("RGB", (32, 32), color=(128, 64, 200))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        loop = asyncio.new_event_loop()
-        try:
-            r1 = loop.run_until_complete(
-                extractor.extract_query(img_b64, device="cpu")
-            )
-            r2 = loop.run_until_complete(
-                extractor.extract_query(img_b64, device="cpu")
-            )
-        finally:
-            loop.close()
-        # 同图 → 同向量
-        assert r1.global_vec == r2.global_vec
-        assert r1.model_version == "mock-v0"
-        assert r1.embedding_dim == 256
+        assert extractor._use_remote is True
 
 
 class TestBitmapGrpcClientStructure:

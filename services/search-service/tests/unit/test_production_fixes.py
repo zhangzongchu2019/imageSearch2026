@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-os.environ["IMGSRCH_ALLOW_MOCK_INFERENCE"] = "true"
+os.environ["INFERENCE_SERVICE_URL"] = "http://inference-test:8090"
 
 
 class TestConfigService:

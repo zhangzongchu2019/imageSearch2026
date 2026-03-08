@@ -198,17 +198,27 @@ class MilvusSearchClient:
         return await self.search_by_tags_inverted(tags, top_k, "ts_month >= 0")
 
     @staticmethod
+    def _safe_get(entity, field, default=None):
+        """Safely get a field from a Milvus Hit entity."""
+        try:
+            return entity.get(field)
+        except Exception:
+            return default
+
+    @staticmethod
     def _parse_results(hits, source: str) -> List[Candidate]:
         candidates = []
+        _get = MilvusSearchClient._safe_get
         for hit in hits:
+            image_pk = _get(hit.entity, "image_pk")
             candidates.append(
                 Candidate(
-                    image_pk=hit.entity.get("image_pk", hit.id),
+                    image_pk=image_pk if image_pk is not None else hit.id,
                     score=hit.score,
-                    product_id=hit.entity.get("product_id"),
-                    is_evergreen=hit.entity.get("is_evergreen", False),
-                    category_l1=hit.entity.get("category_l1"),
-                    tags=hit.entity.get("tags"),
+                    product_id=_get(hit.entity, "product_id"),
+                    is_evergreen=_get(hit.entity, "is_evergreen", False),
+                    category_l1=_get(hit.entity, "category_l1"),
+                    tags=_get(hit.entity, "tags"),
                     source=source,
                 )
             )

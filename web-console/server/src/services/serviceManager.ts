@@ -5,6 +5,7 @@ import { config } from '../config.js';
 const SERVICE_WHITELIST = new Set([
   'search-service',
   'write-service',
+  'inference-service',
   'cron-scheduler',
   'bitmap-filter-service',
   'flink-jobmanager',

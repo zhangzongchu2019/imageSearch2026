@@ -180,9 +180,18 @@ function SingleSearch() {
                       hoverable
                       onClick={() => openCompare(item)}
                       cover={
-                        <div style={{ height: 120, background: '#f5f5f5', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                          <Text type="secondary" style={{ fontSize: 10 }}>{item.image_id.slice(0, 12)}</Text>
-                        </div>
+                        item.image_url ? (
+                          <img
+                            src={item.image_url}
+                            alt={item.image_id}
+                            style={{ height: 120, width: '100%', objectFit: 'cover' }}
+                            onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                          />
+                        ) : (
+                          <div style={{ height: 120, background: '#f5f5f5', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            <Text type="secondary" style={{ fontSize: 10 }}>{item.image_id.slice(0, 12)}</Text>
+                          </div>
+                        )
                       }
                     >
                       <div>
@@ -219,6 +228,9 @@ function SingleSearch() {
             </Col>
             <Col span={12}>
               <Card title="匹配结果" size="small">
+                {selectedResult.image_url && (
+                  <img src={selectedResult.image_url} alt="match" style={{ width: '100%', marginBottom: 12 }} />
+                )}
                 <Descriptions column={1} size="small">
                   <Descriptions.Item label="图片 ID">{selectedResult.image_id}</Descriptions.Item>
                   <Descriptions.Item label="相似度">

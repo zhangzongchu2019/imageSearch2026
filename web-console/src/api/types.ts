@@ -32,6 +32,7 @@ export interface UpdateImageRequest {
 export interface SearchResultItem {
   image_id: string;
   score: number;
+  image_url?: string;
   product_id: string;
   position: number;
   is_evergreen: boolean;

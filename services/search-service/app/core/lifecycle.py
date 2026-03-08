@@ -204,6 +204,7 @@ class ServiceLifecycle:
             scope_resolver=scope_resolver,
             vocab_cache=vocab_cache,
             search_logger=search_logger,
+            pg_pool=self.pg_pool,
         )
 
         # 8. 限流器
@@ -270,7 +271,7 @@ class ServiceLifecycle:
         while True:
             try:
                 p99, error_rate = self._read_live_metrics()
-                self.degrade_fsm.tick(p99, error_rate)
+                await self.degrade_fsm.tick(p99, error_rate)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

@@ -225,9 +225,10 @@ function FileImport() {
   const [file, setFile] = useState<File | null>(null);
   const [startLine, setStartLine] = useState(1);
   const [endLine, setEndLine] = useState(10000);
-  const [concurrency, setConcurrency] = useState(8);
+  const [channelConcurrency, setChannelConcurrency] = useState(2);
   const [retries, setRetries] = useState(2);
   const [skipKafka, setSkipKafka] = useState(true);
+  const [proxies, setProxies] = useState('socks5://127.0.0.1:61081\nsocks5://127.0.0.1:61082');
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<FileImportProgress | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -292,7 +293,15 @@ function FileImport() {
 
     const formData = new FormData();
     formData.append('file', file);
-    formData.append('params', JSON.stringify({ start: startLine, end: endLine, concurrency, retries, skip_kafka: skipKafka }));
+    const proxyList = proxies.split('\n').map(s => s.trim()).filter(Boolean);
+    formData.append('params', JSON.stringify({
+      start: startLine,
+      end: endLine,
+      proxies: proxyList,
+      channel_concurrency: channelConcurrency,
+      retries,
+      skip_kafka: skipKafka,
+    }));
 
     try {
       const res = await fetch(bffApi.fileImportUrl, {
@@ -359,6 +368,17 @@ function FileImport() {
         <p className="ant-upload-hint">支持 .txt / .csv 文件，每行一个图片 URL</p>
       </Upload.Dragger>
 
+      <Form layout="vertical" style={{ marginBottom: 16, maxWidth: 500 }}>
+        <Form.Item label="代理列表（每行一个，留空则仅直连）" tooltip="支持 socks5:// 代理，BFF 将通过代理下载图片再转发给 write-service">
+          <TextArea
+            rows={3}
+            value={proxies}
+            onChange={(e) => setProxies(e.target.value)}
+            placeholder="socks5://127.0.0.1:61081&#10;socks5://127.0.0.1:61082"
+            style={{ fontFamily: 'monospace', fontSize: 12 }}
+          />
+        </Form.Item>
+      </Form>
       <Form layout="inline" style={{ marginBottom: 16, gap: '8px 0', flexWrap: 'wrap' }}>
         <Form.Item label="起始行">
           <InputNumber min={1} max={10000000} value={startLine} onChange={(v) => setStartLine(v || 1)} style={{ width: 120 }} />
@@ -366,8 +386,8 @@ function FileImport() {
         <Form.Item label="结束行">
           <InputNumber min={1} max={10000000} value={endLine} onChange={(v) => setEndLine(v || 10000)} style={{ width: 120 }} />
         </Form.Item>
-        <Form.Item label="并行数">
-          <InputNumber min={1} max={64} value={concurrency} onChange={(v) => setConcurrency(v || 8)} style={{ width: 80 }} />
+        <Form.Item label="每通道并发量" tooltip="每个通道（直连 + 各代理）的最大并发数">
+          <InputNumber min={1} max={20} value={channelConcurrency} onChange={(v) => setChannelConcurrency(v || 6)} style={{ width: 80 }} />
         </Form.Item>
         <Form.Item label="重试次数">
           <InputNumber min={0} max={10} value={retries} onChange={(v) => setRetries(v ?? 2)} style={{ width: 80 }} />

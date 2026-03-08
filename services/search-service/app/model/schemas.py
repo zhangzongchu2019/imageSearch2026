@@ -126,6 +126,7 @@ class EffectiveParams:
 class SearchResultItem(BaseModel):
     image_id: str
     score: float
+    image_url: Optional[str] = None
     product_id: Optional[str] = None
     position: int
     is_evergreen: bool = False

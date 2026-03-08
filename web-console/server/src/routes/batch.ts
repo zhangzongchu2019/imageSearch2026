@@ -4,6 +4,8 @@ import { v4 as uuid } from 'uuid';
 import path from 'path';
 import fs from 'fs';
 import readline from 'readline';
+import axios from 'axios';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import { config } from '../config.js';
 import { orchestrateBatchImport } from '../services/batchOrchestrator.js';
 import { searchClient } from '../services/searchClient.js';
@@ -99,7 +101,23 @@ router.post('/search', upload.array('files', 128), async (req, res) => {
   res.end();
 });
 
-// File import — read URL list and call write-service API for each
+// ---------- Semaphore for per-channel concurrency control ----------
+class Semaphore {
+  private running = 0;
+  private queue: (() => void)[] = [];
+  constructor(private max: number) {}
+  async acquire(): Promise<void> {
+    if (this.running < this.max) { this.running++; return; }
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+  }
+  release(): void {
+    this.running--;
+    const next = this.queue.shift();
+    if (next) { this.running++; next(); }
+  }
+}
+
+// ---------- File import — multi-channel proxy download ----------
 const txtUpload = multer({ storage, limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB
 
 router.post('/file-import', txtUpload.single('file'), async (req, res) => {
@@ -116,8 +134,16 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
   const params = JSON.parse(req.body.params || '{}');
   const startLine = Math.max(1, params.start || 1);          // 1-based
   const endLine = params.end || 10000000;
-  const concurrency = Math.min(64, Math.max(1, params.concurrency || config.batchConcurrency));
   const maxRetries = Math.min(10, Math.max(0, params.retries ?? 2));
+
+  // Proxy channels from request params (override env default)
+  const proxies: string[] = Array.isArray(params.proxies) ? params.proxies.filter(Boolean) : config.proxyChannels;
+  const channelConcurrency = Math.min(20, Math.max(1, params.channel_concurrency || config.channelConcurrency));
+
+  // Build channel list: [null (direct), ...proxy URLs]
+  const channels: (string | null)[] = [null, ...proxies];
+  const channelSemaphores = channels.map(() => new Semaphore(channelConcurrency));
+  const channelStats = channels.map(() => ({ succeeded: 0, failed: 0, active: 0 }));
 
   // SSE headers
   res.writeHead(200, {
@@ -134,7 +160,7 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
   req.on('close', () => { aborted = true; });
 
   try {
-    // 1) Read URLs from file — stream, then slice [startLine, endLine]
+    // 1) Read URLs from file
     sendSSE({ stage: 'collect', completed: 0, total: 0, message: '正在读取 URL 列表...' });
     const allUrls: string[] = await new Promise((resolve, reject) => {
       const lines: string[] = [];
@@ -146,7 +172,6 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
       rl.on('close', () => resolve(lines));
       rl.on('error', reject);
     });
-    // Slice by line range (1-based inclusive)
     const urls = allUrls.slice(startLine - 1, endLine);
     const total = urls.length;
 
@@ -158,16 +183,16 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
       return;
     }
 
+    const channelLabels = channels.map((c, i) => c ? `通道${i}(${c})` : `通道0(直连)`);
     sendSSE({ stage: 'collect', completed: 0, total, message: `文件共 ${allUrls.length} 行，选取第 ${startLine}~${startLine + total - 1} 行，共 ${total} 条 URL` });
-    sendSSE({ type: 'log', message: `将处理 ${total} 条 URL（并行 ${concurrency}，重试 ${maxRetries} 次）` });
+    sendSSE({ type: 'log', message: `${channels.length} 个通道: ${channelLabels.join(', ')}，每通道并发 ${channelConcurrency}，重试 ${maxRetries} 次` });
 
-    // 2) Process URLs in batches via write-service API
+    // 2) Process URLs with multi-channel round-robin
     let completed = 0;
     let succeeded = 0;
     let failed = 0;
     const apiKey = req.headers['x-api-key'] as string | undefined;
 
-    // Save checkpoint for resume
     const checkpointFile = path.join(config.uploadDir, 'batch_import_checkpoint.json');
     const saveCheckpoint = () => {
       try {
@@ -184,66 +209,112 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
       } catch {}
     };
 
-    // Helper: call write-service with retries
-    const importOne = async (url: string): Promise<{ success: boolean; image_id?: string; error?: string }> => {
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-          const resp = await writeClient.post(
-            '/api/v1/image/update',
-            {
-              uri: url,
-              merchant_id: `auto_${Date.now()}`,
-              category_l1: '服装',
-              product_id: `file_import_${completed}`,
-            },
-            {
-              headers: apiKey ? { 'X-API-Key': apiKey } : {},
-              timeout: 30000,
-            },
-          );
-          return { success: true, image_id: resp.data.image_id };
-        } catch (e: any) {
-          if (attempt < maxRetries) {
-            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-            continue;
-          }
-          const msg = e.response?.data?.detail?.error?.message || e.response?.data?.message || e.message;
-          return { success: false, error: msg };
-        }
+    // Download image via proxy to local upload dir, return local URL
+    const downloadToLocal = async (url: string, proxyUrl: string | null): Promise<string> => {
+      const ext = path.extname(new URL(url).pathname) || '.jpg';
+      const filename = `${uuid()}${ext}`;
+      const localPath = path.join(config.uploadDir, filename);
+
+      const axiosOpts: any = {
+        responseType: 'arraybuffer' as const,
+        timeout: 30000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+      };
+      if (proxyUrl) {
+        const agent = new SocksProxyAgent(proxyUrl);
+        axiosOpts.httpAgent = agent;
+        axiosOpts.httpsAgent = agent;
       }
-      return { success: false, error: 'unreachable' };
+
+      const resp = await axios.get(url, axiosOpts);
+      fs.writeFileSync(localPath, Buffer.from(resp.data));
+      return `${config.uploadUrlBase}/uploads/${filename}`;
     };
 
-    for (let i = 0; i < total && !aborted; i += concurrency) {
-      const batch = urls.slice(i, i + concurrency);
-      const promises = batch.map(async (url) => {
-        const result = await importOne(url);
-        if (result.success) {
+    // Process a single URL on a given channel
+    const importOne = async (url: string, chIdx: number): Promise<{ success: boolean; image_id?: string; error?: string }> => {
+      const sem = channelSemaphores[chIdx];
+      const stats = channelStats[chIdx];
+      const proxyUrl = channels[chIdx];
+
+      await sem.acquire();
+      stats.active++;
+      try {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+          try {
+            // Step 1: download image to local via proxy
+            const localUrl = await downloadToLocal(url, proxyUrl);
+            // Step 2: 50ms anti-burst delay
+            await new Promise((r) => setTimeout(r, 50));
+            // Step 3: send local URL to write-service
+            const resp = await writeClient.post(
+              '/api/v1/image/update',
+              {
+                uri: localUrl,
+                merchant_id: `auto_${Date.now()}`,
+                category_l1: '服装',
+                product_id: `file_import_${completed}`,
+              },
+              {
+                headers: apiKey ? { 'X-API-Key': apiKey } : {},
+                timeout: 30000,
+              },
+            );
+            stats.succeeded++;
+            return { success: true, image_id: resp.data.image_id };
+          } catch (e: any) {
+            if (attempt < maxRetries) {
+              await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+              continue;
+            }
+            const msg = e.response?.data?.detail?.error?.message || e.response?.data?.message || e.message;
+            stats.failed++;
+            return { success: false, error: `[${channelLabels[chIdx]}] ${msg}` };
+          }
+        }
+        return { success: false, error: 'unreachable' };
+      } finally {
+        stats.active--;
+        sem.release();
+      }
+    };
+
+    // Launch all URLs concurrently — semaphores handle per-channel throttling
+    const promises = urls.map((url, idx) => {
+      if (aborted) return Promise.resolve();
+      const chIdx = idx % channels.length; // round-robin
+      return importOne(url, chIdx).then((result) => {
+        if (result && result.success) {
           succeeded++;
-        } else {
+        } else if (result) {
           failed++;
           sendSSE({ type: 'log', message: `[失败] ${url}: ${result.error}` });
         }
         completed++;
-        return result;
+
+        // Send progress periodically (every item for small batches, every 10 for large)
+        if (total < 100 || completed % 10 === 0 || completed === total) {
+          const chStatsMsg = channelStats.map((s, i) =>
+            `${channelLabels[i]}: 成功${s.succeeded}/失败${s.failed}/活跃${s.active}`
+          ).join(' | ');
+          sendSSE({
+            stage: completed >= total ? 'done' : 'milvus',
+            completed,
+            total,
+            message: `已处理 ${completed}/${total} (成功 ${succeeded}, 失败 ${failed})`,
+            channels: chStatsMsg,
+          });
+        }
+
+        if (completed % (channelConcurrency * channels.length * 5) === 0) {
+          saveCheckpoint();
+        }
       });
+    });
 
-      await Promise.allSettled(promises);
-
-      // Send progress
-      const stage = completed >= total ? 'done' : 'milvus';
-      sendSSE({
-        stage,
-        completed,
-        total,
-        message: `已处理 ${completed}/${total} (成功 ${succeeded}, 失败 ${failed})`,
-      });
-
-      // Save checkpoint every batch
-      if (completed % (concurrency * 5) === 0) {
-        saveCheckpoint();
-      }
-    }
+    await Promise.allSettled(promises);
 
     // Final
     if (aborted) {
@@ -251,8 +322,10 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
       sendSSE({ type: 'log', message: '导入被中断，已保存断点' });
     } else {
       sendSSE({ stage: 'done', completed, total, message: `导入完成: 成功 ${succeeded}, 失败 ${failed}` });
-      sendSSE({ type: 'log', message: `导入完成！共 ${total} 条，成功 ${succeeded}，失败 ${failed}` });
-      // Clean up checkpoint on success
+      const chStatsMsg = channelStats.map((s, i) =>
+        `${channelLabels[i]}: 成功${s.succeeded}/失败${s.failed}`
+      ).join(' | ');
+      sendSSE({ type: 'log', message: `导入完成！共 ${total} 条，成功 ${succeeded}，失败 ${failed}\n通道统计: ${chStatsMsg}` });
       try { fs.unlinkSync(checkpointFile); } catch {}
     }
   } catch (e: any) {

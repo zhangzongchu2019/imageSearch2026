@@ -14,6 +14,7 @@ END $$;
 CREATE TABLE IF NOT EXISTS uri_dedup (
     image_pk    CHAR(32)     PRIMARY KEY,
     uri_hash    CHAR(64)     NOT NULL,
+    uri         TEXT,
     ts_month    INT          NOT NULL,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );

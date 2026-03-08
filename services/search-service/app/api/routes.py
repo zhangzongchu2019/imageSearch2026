@@ -114,7 +114,8 @@ async def search_image(
         response = await lifecycle.pipeline.execute(req, request_id)
         return response
     except Exception as e:
-        logger.error("search_pipeline_error", request_id=request_id, error=str(e))
+        import traceback
+        logger.error("search_pipeline_error", request_id=request_id, error=str(e), traceback=traceback.format_exc())
         METRICS.search_errors_total.labels(code="100_05_01").inc()
         raise HTTPException(status_code=500, detail={
             "error": {
@@ -197,7 +198,9 @@ async def readyz(request: Request):
 async def degrade_status(request: Request):
     """返回 FSM 完整状态 — 含 epoch、窗口指标、Redis 连接状态"""
     lifecycle = request.app.state.lifecycle
-    fsm = lifecycle._degrade_fsm
+    fsm = getattr(lifecycle, '_degrade_fsm', None)
+    if fsm is None:
+        return {"state": "unknown", "message": "degrade FSM not initialized"}
     return fsm.status()
 
 
@@ -237,14 +240,14 @@ async def degrade_override(
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid state: {state}")
     lifecycle = request.app.state.lifecycle
-    lifecycle.degrade_fsm.force_state(target, reason)
+    await lifecycle.degrade_fsm.force_state(target, reason)
     return {"status": "ok", "state": target.value}
 
 
 @router.post("/admin/degrade/release", summary="解除人工降级")
 async def degrade_release(reason: str = "", request: Request = None):
     lifecycle = request.app.state.lifecycle
-    lifecycle.degrade_fsm.force_state(DegradeState.S0, reason)
+    await lifecycle.degrade_fsm.force_state(DegradeState.S0, reason)
     return {"status": "ok", "state": "S0"}
 
 

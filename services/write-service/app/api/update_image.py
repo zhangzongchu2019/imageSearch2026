@@ -266,10 +266,12 @@ async def _process_new_image(deps, image_pk: str, req: UpdateImageRequest, trace
             async with pg.acquire() as conn:
                 async with conn.transaction():
                     await conn.execute(
-                        """INSERT INTO uri_dedup (image_pk, uri_hash, ts_month)
-                           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING""",
+                        """INSERT INTO uri_dedup (image_pk, uri_hash, uri, ts_month)
+                           VALUES ($1, $2, $3, $4)
+                           ON CONFLICT (image_pk) DO UPDATE SET uri = EXCLUDED.uri""",
                         image_pk,
                         hashlib.sha256(req.uri.encode()).hexdigest(),
+                        req.uri,
                         ts_month,
                     )
             completed_steps.append("pg_dedup")
@@ -363,7 +365,7 @@ async def _process_new_image(deps, image_pk: str, req: UpdateImageRequest, trace
         logger.error(
             "process_new_image_failed",
             image_pk=image_pk, trace_id=trace_id,
-            completed_steps=completed_steps, error=str(e),
+            completed_steps=completed_steps, error=str(e) or repr(e),
         )
         raise HTTPException(status_code=500, detail={
             "error": {"code": "200_05_01", "message": "Internal processing error"}
@@ -414,45 +416,49 @@ async def _download_image(uri: str, timeout: float = 10.0, retries: int = 3) -> 
     raise RuntimeError("unreachable")
 
 
+class _FeatureResult:
+    """特征提取结果"""
+    __slots__ = ("global_vec", "tags_pred", "category_l1_pred")
+
+    def __init__(self, global_vec, tags_pred, category_l1_pred):
+        self.global_vec = global_vec
+        self.tags_pred = tags_pred
+        self.category_l1_pred = category_l1_pred
+
+
+_infer_rr_counter = 0
+
 async def _extract_features(deps, image_bytes: bytes):
-    """特征提取"""
-    allow_mock = os.getenv("IMGSRCH_ALLOW_MOCK_INFERENCE", "false").lower() == "true"
-    inference_url = os.getenv("INFERENCE_SERVICE_URL")
+    """特征提取 — 多实例轮询调用远程 inference-service"""
+    import base64
+    global _infer_rr_counter
 
-    if inference_url:
-        import base64
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                f"{inference_url}/api/v1/extract",
-                json={"image_b64": base64.b64encode(image_bytes).decode()},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+    clients = deps.get("inference_clients", [])
+    urls = deps.get("inference_urls", [])
+    if not clients:
+        raise RuntimeError(
+            "No inference_client in deps. "
+            "Set INFERENCE_SERVICE_URL(S) to configure the remote inference service."
+        )
 
-            class _Result:
-                pass
-            result = _Result()
-            result.global_vec = data["global_vec"]
-            result.tags_pred = data.get("tags_pred", [])
-            result.category_l1_pred = data.get("category_l1_pred", 0)
-            return result
+    # Round-robin 选择实例
+    idx = _infer_rr_counter % len(clients)
+    _infer_rr_counter += 1
+    client = clients[idx]
+    url = urls[idx]
 
-    if allow_mock:
-        import numpy as np
-        seed = int.from_bytes(image_bytes[:4], "big") if len(image_bytes) >= 4 else 0
-        rng = np.random.RandomState(seed % (2**31))
-        vec = rng.randn(256).astype("float32")
-        vec = (vec / np.linalg.norm(vec)).tolist()
+    resp = await client.post(
+        f"{url}/api/v1/extract",
+        json={"image_b64": base64.b64encode(image_bytes).decode()},
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
-        class _MockResult:
-            pass
-        result = _MockResult()
-        result.global_vec = vec
-        result.tags_pred = rng.choice(1000, 5, replace=False).tolist()
-        result.category_l1_pred = int(rng.randint(0, 200))
-        return result
-
-    raise RuntimeError("No inference service configured.")
+    return _FeatureResult(
+        global_vec=data["global_vec"],
+        tags_pred=data.get("tags_pred", []),
+        category_l1_pred=data.get("category_l1_pred", 0),
+    )
 
 
 async def _check_evergreen(deps, category_l1: str) -> bool:

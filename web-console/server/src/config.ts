@@ -11,4 +11,7 @@ export const config = {
   prometheusUrl: process.env.PROMETHEUS_URL || 'http://localhost:9099',
   // Internal URL base for uploaded files — reachable from other containers via Docker network
   uploadUrlBase: process.env.UPLOAD_URL_BASE || `http://web-console:3000`,
+  // Proxy channels for multi-channel download (e.g. PROXY_CHANNELS=socks5://127.0.0.1:61081,socks5://127.0.0.1:61082)
+  proxyChannels: (process.env.PROXY_CHANNELS || '').split(',').filter(Boolean),
+  channelConcurrency: parseInt(process.env.CHANNEL_CONCURRENCY || '2'),
 };

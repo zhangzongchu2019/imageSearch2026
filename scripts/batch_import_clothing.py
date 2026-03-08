@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-批量导入 10,000 张服装图片到 Milvus + PostgreSQL
+批量导入服装图片到 Milvus + PostgreSQL
 
-使用 open-clip-torch (ViT-B/32) 提取 512 维特征，PCA 降维到 256 维，
+使用 open-clip-torch (ViT-B/32, openai 预训练) 提取 512 维特征，
+正交随机投影降维到 256 维（与 inference-service seed=42 一致），
 直接批量写入 Milvus global_images_hot 和 PG uri_dedup。
 
 Usage:
-    python3 /tmp/batch_import_clothing.py --count 10000
-    python3 /tmp/batch_import_clothing.py --count 100 --local-dir /path/to/images
-    python3 /tmp/batch_import_clothing.py --count 10000 --skip-kafka
+    python3 scripts/batch_import_clothing.py --count 10000
+    python3 scripts/batch_import_clothing.py --count 100 --local-dir /path/to/images
+    python3 scripts/batch_import_clothing.py --count 10000 --skip-kafka
+    python3 scripts/batch_import_clothing.py --count 10000 \\
+        --proxies socks5://127.0.0.1:61081,socks5://127.0.0.1:61082
+    python3 scripts/batch_import_clothing.py --count 100 --backup-dir ~/imgsrch_backup
 """
 
 import argparse
@@ -53,7 +57,7 @@ KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 COLLECTION_NAME = "global_images_hot"
 PARTITION_NAME = "p_202603"
 TS_MONTH = 202603
-DOWNLOAD_CONCURRENCY = 10
+DOWNLOAD_CONCURRENCY = 6      # per-channel concurrency
 GPU_BATCH_SIZE = 128
 MILVUS_BATCH_SIZE = 5000
 MERCHANT_ID_START = 10001
@@ -61,18 +65,25 @@ MERCHANT_ID_END = 12999
 CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "/tmp/batch_import_checkpoint.json")
 
 
-# ── 1. Image URL Collection ─────────────────────────────────────────────────
+# ── Projection Matrix (matches inference-service exactly) ─────────────────
+def build_projection_matrix() -> np.ndarray:
+    """Build orthogonal projection matrix (512 → 256), seed=42.
+    Identical to inference-service/app/main.py."""
+    rng = np.random.RandomState(42)
+    proj = rng.randn(CLIP_DIM, EMBEDDING_DIM).astype(np.float32)
+    u, _, vt = np.linalg.svd(proj, full_matrices=False)
+    return u  # (512, 256) orthogonal matrix
 
-# Curated list of public clothing image URL patterns.
-# We use Open Images V7 downloader-compatible URLs (hosted on Flickr/Google).
-# For reliability, we also provide a Fashionpedia fallback and local-dir mode.
+
+PROJECTION_MATRIX = None  # lazy init
+
+
+# ── 1. Image URL Collection ─────────────────────────────────────────────────
 
 FASHIONPEDIA_MANIFEST = (
     "https://raw.githubusercontent.com/cvdfoundation/fashionpedia/main/train_images.txt"
 )
 
-# Backup: generate deterministic synthetic URLs from known open image datasets.
-# These are placeholder patterns; real deployment should use actual manifest files.
 OPEN_IMAGES_CLOTHING_LABELS = [
     "Shirt", "Dress", "Coat", "Jacket", "Jeans", "Skirt", "Suit",
     "T-shirt", "Sweater", "Shorts", "Blouse", "Pants", "Hoodie",
@@ -127,7 +138,6 @@ def collect_image_urls_from_file(url_file: str, count: int) -> list[dict]:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Skip header lines (e.g. "full_url", "url", column names)
             if not line.startswith(("http://", "https://", "ftp://")):
                 log.info(f"Skipping non-URL line: {line[:80]}")
                 continue
@@ -174,7 +184,7 @@ def collect_image_urls_from_local(local_dir: str, count: int) -> list[dict]:
 
 def collect_image_urls_generated(count: int) -> list[dict]:
     """
-    Generate image metadata using Unsplash Source (public, no auth needed).
+    Generate image metadata using picsum.photos (public, no auth needed).
     Each URL is unique via query parameters.
     """
     categories = [
@@ -185,7 +195,6 @@ def collect_image_urls_generated(count: int) -> list[dict]:
     results = []
     for i in range(count):
         cat = categories[i % len(categories)]
-        # Use picsum.photos for reliable public images (clothing-like via seed)
         url = f"https://picsum.photos/seed/clothing_{cat}_{i:05d}/224/224"
         results.append({
             "uri": url,
@@ -243,18 +252,30 @@ async def collect_image_urls(count: int, local_dir: Optional[str] = None,
     return collect_image_urls_generated(count)
 
 
-# ── 2. Image Download ────────────────────────────────────────────────────────
+# ── 2. Image Download (multi-channel proxy support) ──────────────────────────
+
+def _parse_proxies(proxies_str: Optional[str]) -> list[Optional[str]]:
+    """Parse comma-separated proxy URLs. Always includes None (direct) as last channel."""
+    channels = []
+    if proxies_str:
+        for p in proxies_str.split(","):
+            p = p.strip()
+            if p:
+                channels.append(p)
+    channels.append(None)  # direct connection channel
+    return channels
+
 
 async def download_images(
     image_metas: list[dict],
     download_dir: str = "/tmp/clothing_images",
+    proxies_str: Optional[str] = None,
 ) -> list[dict]:
-    """Download images concurrently. Returns updated metas with local_path set."""
+    """Download images concurrently via multiple proxy channels + direct."""
     import httpx
 
     os.makedirs(download_dir, exist_ok=True)
 
-    # Skip already-local images
     to_download = [m for m in image_metas if m["local_path"] is None]
     already_local = [m for m in image_metas if m["local_path"] is not None]
 
@@ -262,14 +283,40 @@ async def download_images(
         log.info("All images are local, skipping download")
         return image_metas
 
-    log.info(f"Downloading {len(to_download)} images (concurrency={DOWNLOAD_CONCURRENCY})...")
+    channels = _parse_proxies(proxies_str)
+    log.info(f"Download channels: {len(channels)} "
+             f"({len(channels)-1} proxies + 1 direct), "
+             f"concurrency={DOWNLOAD_CONCURRENCY}/channel")
 
-    sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
     success = 0
     failed = 0
 
-    async def _download_one(client: httpx.AsyncClient, meta: dict):
+    dl_headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": "https://www.szwego.com/",
+    }
+
+    # Build one httpx client per channel
+    clients = []
+    sems = []
+    for proxy in channels:
+        transport = None
+        if proxy:
+            transport = httpx.AsyncHTTPTransport(proxy=proxy)
+        client = httpx.AsyncClient(
+            timeout=30,
+            headers=dl_headers,
+            transport=transport,
+        )
+        clients.append(client)
+        sems.append(asyncio.Semaphore(DOWNLOAD_CONCURRENCY))
+
+    async def _download_one(meta: dict, channel_idx: int):
         nonlocal success, failed
+        client = clients[channel_idx]
+        sem = sems[channel_idx]
         async with sem:
             fname = f"{meta['image_pk'][:16]}.jpg"
             fpath = os.path.join(download_dir, fname)
@@ -290,56 +337,77 @@ async def download_images(
                     failed += 1
             except Exception:
                 failed += 1
+            # Small delay to avoid bursting
+            await asyncio.sleep(0.05)
 
-    dl_headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Referer": "https://www.szwego.com/",
-    }
-    async with httpx.AsyncClient(timeout=30, headers=dl_headers) as client:
-        tasks = [_download_one(client, m) for m in to_download]
-        # Process in chunks to show progress
-        chunk_size = 500
-        for i in range(0, len(tasks), chunk_size):
-            chunk = tasks[i : i + chunk_size]
-            await asyncio.gather(*chunk, return_exceptions=True)
-            done_count = min(i + chunk_size, len(tasks))
-            log.info(f"  Download progress: {done_count}/{len(tasks)} "
-                     f"(ok={success}, fail={failed})")
-            emit_progress("download", done_count, len(tasks),
-                          f"Downloaded {done_count}/{len(tasks)} (ok={success}, fail={failed})")
+    # Round-robin assign tasks to channels
+    tasks = []
+    for i, meta in enumerate(to_download):
+        channel_idx = i % len(channels)
+        tasks.append(_download_one(meta, channel_idx))
+
+    total_tasks = len(tasks)
+    log.info(f"Downloading {total_tasks} images across {len(channels)} channels ...")
+
+    chunk_size = 500
+    for i in range(0, len(tasks), chunk_size):
+        chunk = tasks[i : i + chunk_size]
+        await asyncio.gather(*chunk, return_exceptions=True)
+        done_count = min(i + chunk_size, total_tasks)
+        log.info(f"  Download progress: {done_count}/{total_tasks} "
+                 f"(ok={success}, fail={failed})")
+        emit_progress("download", done_count, total_tasks,
+                      f"Downloaded {done_count}/{total_tasks} (ok={success}, fail={failed})")
+
+    # Close all clients
+    for client in clients:
+        await client.aclose()
 
     log.info(f"Download complete: {success} ok, {failed} failed")
 
-    # Filter out failed downloads
     result = already_local + [m for m in to_download if m["local_path"] is not None]
     return result
 
 
-# ── 3. Feature Extraction (CLIP + PCA) ───────────────────────────────────────
+# ── 3. Feature Extraction (CLIP + Orthogonal Projection) ─────────────────────
 
 class CLIPFeatureExtractor:
-    """CLIP ViT-B/32 feature extractor with PCA 512→256."""
+    """CLIP ViT-B/32 feature extractor with orthogonal projection 512→256.
+
+    Uses the 'openai' pretrained weights and seed=42 projection matrix,
+    matching inference-service exactly.
+    """
 
     def __init__(self, device: str = "cuda", model_path: Optional[str] = None):
+        global PROJECTION_MATRIX
+
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         log.info(f"Loading CLIP ViT-B/32 on {self.device}...")
 
+        # Monkey-patch torch.load for PyTorch 2.6+ compatibility
+        _orig_torch_load = torch.load
+        torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
+
         if model_path and os.path.exists(model_path):
-            # Load from local checkpoint
             log.info(f"Loading from local checkpoint: {model_path}")
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(
                 "ViT-B-32", pretrained=model_path, device=self.device,
             )
         else:
-            # Download from HuggingFace
+            log.info("Downloading CLIP ViT-B/32 (openai pretrained) ...")
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-                "ViT-B-32", pretrained="laion2b_s34b_b79k", device=self.device,
+                "ViT-B-32", pretrained="openai", device=self.device,
             )
+
+        torch.load = _orig_torch_load  # restore
         self.model.eval()
-        self.pca_components = None  # Fitted after first batch
-        self.pca_mean = None
-        log.info("CLIP model loaded")
+
+        # Build projection matrix (same as inference-service)
+        if PROJECTION_MATRIX is None:
+            PROJECTION_MATRIX = build_projection_matrix()
+        self.projection = PROJECTION_MATRIX
+
+        log.info("CLIP model loaded, projection matrix initialized (512→256, seed=42)")
 
     def _load_image(self, path: str) -> Optional[torch.Tensor]:
         try:
@@ -348,32 +416,9 @@ class CLIPFeatureExtractor:
         except Exception:
             return None
 
-    def _fit_pca(self, features_512: np.ndarray):
-        """Fit PCA on the first batch of features."""
-        n_samples = len(features_512)
-        log.info(f"Fitting PCA ({CLIP_DIM} → {EMBEDDING_DIM}) on {n_samples} samples...")
-        self.pca_mean = features_512.mean(axis=0)
-        centered = features_512 - self.pca_mean
-
-        if n_samples < EMBEDDING_DIM:
-            # Not enough samples for full PCA; use random projection as fallback
-            log.warning(f"Only {n_samples} samples < {EMBEDDING_DIM} dims, "
-                        "using truncated projection (results may be suboptimal)")
-            rng = np.random.RandomState(42)
-            proj = rng.randn(CLIP_DIM, EMBEDDING_DIM).astype(np.float32)
-            # Orthogonalize
-            Q, _ = np.linalg.qr(proj)
-            self.pca_components = Q[:, :EMBEDDING_DIM]
-        else:
-            # SVD for PCA
-            U, S, Vt = np.linalg.svd(centered, full_matrices=False)
-            self.pca_components = Vt[:EMBEDDING_DIM].T  # (512, 256)
-        log.info("PCA fitted")
-
-    def _apply_pca(self, features_512: np.ndarray) -> np.ndarray:
-        centered = features_512 - self.pca_mean
-        reduced = centered @ self.pca_components  # (N, 256)
-        # L2 normalize
+    def _project(self, features_512: np.ndarray) -> np.ndarray:
+        """Project 512-dim features to 256-dim using orthogonal matrix + L2 normalize."""
+        reduced = features_512 @ self.projection  # (N, 256)
         norms = np.linalg.norm(reduced, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-8)
         return (reduced / norms).astype(np.float32)
@@ -399,18 +444,17 @@ class CLIPFeatureExtractor:
         features = self.model.encode_image(batch)
         features_512 = features.cpu().numpy().astype(np.float32)
 
-        # L2 normalize 512-dim first
-        norms = np.linalg.norm(features_512, axis=1, keepdims=True)
-        features_512 = features_512 / np.maximum(norms, 1e-8)
+        # Project to 256-dim (no PCA, uses fixed orthogonal projection)
+        features_256 = self._project(features_512)
 
-        return valid_paths, features_512
+        return valid_paths, features_256
 
     def extract_all(self, image_metas: list[dict]) -> list[dict]:
         """Extract features for all images. Updates metas with 'global_vec'."""
         paths = [m["local_path"] for m in image_metas]
         path_to_meta = {m["local_path"]: m for m in image_metas}
 
-        all_512 = []
+        all_256 = []
         all_valid_paths = []
 
         total_batches = (len(paths) + GPU_BATCH_SIZE - 1) // GPU_BATCH_SIZE
@@ -420,10 +464,10 @@ class CLIPFeatureExtractor:
         t0 = time.time()
         for i in range(0, len(paths), GPU_BATCH_SIZE):
             batch_paths = paths[i : i + GPU_BATCH_SIZE]
-            valid_paths, features_512 = self.extract_batch(batch_paths)
+            valid_paths, features_256 = self.extract_batch(batch_paths)
             all_valid_paths.extend(valid_paths)
-            if len(features_512) > 0:
-                all_512.append(features_512)
+            if len(features_256) > 0:
+                all_256.append(features_256)
 
             batch_num = i // GPU_BATCH_SIZE + 1
             if batch_num % 10 == 0 or batch_num == total_batches:
@@ -434,23 +478,12 @@ class CLIPFeatureExtractor:
                 emit_progress("extract", len(all_valid_paths), len(paths),
                               f"Batch {batch_num}/{total_batches}, {rate:.0f} img/sec")
 
-        if not all_512:
+        if not all_256:
             log.error("No features extracted!")
             return []
 
-        all_512 = np.concatenate(all_512, axis=0)
-        log.info(f"Got {len(all_512)} x {CLIP_DIM}-dim features in {time.time()-t0:.1f}s")
-
-        # Fit PCA on all data (or a large sample)
-        if len(all_512) > 2000:
-            pca_sample = all_512[np.random.choice(len(all_512), 2000, replace=False)]
-        else:
-            pca_sample = all_512
-        self._fit_pca(pca_sample)
-
-        # Apply PCA
-        all_256 = self._apply_pca(all_512)
-        log.info(f"PCA done: {all_256.shape}")
+        all_256 = np.concatenate(all_256, axis=0)
+        log.info(f"Projection done: {all_256.shape} in {time.time()-t0:.1f}s")
 
         # Map back to metas
         result = []
@@ -491,6 +524,7 @@ def insert_milvus(image_metas: list[dict]):
         batch = image_metas[i : i + MILVUS_BATCH_SIZE]
 
         rows = []
+        now_ms = int(time.time() * 1000)
         for m in batch:
             rows.append({
                 "image_pk": m["image_pk"],
@@ -499,8 +533,15 @@ def insert_milvus(image_metas: list[dict]):
                 "is_evergreen": False,
                 "category_l1": m.get("category_l1", 0),
                 "category_l2": m.get("category_l2", 0),
+                "category_l3": m.get("category_l3", 0),
                 "tags": m.get("tags", []),
+                "color_code": 0,
+                "material_code": 0,
+                "style_code": 0,
+                "season_code": 0,
                 "ts_month": TS_MONTH,
+                "promoted_at": 0,
+                "created_at": now_ms,
             })
 
         coll.upsert(rows, partition_name=PARTITION_NAME)
@@ -513,10 +554,10 @@ def insert_milvus(image_metas: list[dict]):
     log.info(f"Milvus insert done. Collection entity count: {coll.num_entities}")
 
 
-# ── 5. PostgreSQL Insert ──────────────────────────────────────────────────────
+# ── 5. PostgreSQL Insert (with URI) ──────────────────────────────────────────
 
 def insert_pg_dedup(image_metas: list[dict]):
-    """Batch insert into uri_dedup table."""
+    """Batch insert into uri_dedup table, including URI column."""
     import psycopg2
     from psycopg2.extras import execute_values
 
@@ -528,15 +569,15 @@ def insert_pg_dedup(image_metas: list[dict]):
     total = len(image_metas)
     inserted = 0
 
-    log.info(f"Inserting {total} records into uri_dedup...")
+    log.info(f"Inserting {total} records into uri_dedup (with uri)...")
 
     for i in range(0, total, PG_BATCH):
         batch = image_metas[i : i + PG_BATCH]
-        values = [(m["image_pk"], m["uri_hash"], TS_MONTH) for m in batch]
+        values = [(m["image_pk"], m["uri_hash"], m["uri"], TS_MONTH) for m in batch]
         execute_values(
             cur,
-            "INSERT INTO uri_dedup (image_pk, uri_hash, ts_month) VALUES %s "
-            "ON CONFLICT (image_pk) DO NOTHING",
+            "INSERT INTO uri_dedup (image_pk, uri_hash, uri, ts_month) VALUES %s "
+            "ON CONFLICT (image_pk) DO UPDATE SET uri = EXCLUDED.uri",
             values,
         )
         inserted += len(batch)
@@ -612,29 +653,59 @@ def enrich_metadata(image_metas: list[dict]):
     import random as _random
 
     for m in image_metas:
-        # 一级分类: 服装 (clothing → 1)
-        m["category_l1"] = 1   # shirt/clothing
+        m["category_l1"] = 1
         m["category_l2"] = 101
         m["category_l3"] = 0
-
-        # 商品 ID: P0 + 7位数字
         m["product_id"] = f"P0{m['index']:07d}"
-
-        # 商家 ID: T20260101{10001~12999}
         merchant_num = _random.randint(MERCHANT_ID_START, MERCHANT_ID_END)
         m["merchant_id"] = f"T20260101{merchant_num}"
-
         m["tags"] = [m["category_l1"]]
 
 
-# ── 8. Main ──────────────────────────────────────────────────────────────────
+# ── 8. Local Backup ──────────────────────────────────────────────────────────
+
+def save_backup(image_metas: list[dict], backup_dir: str):
+    """Save metadata.jsonl and copy images to backup directory."""
+    os.makedirs(backup_dir, exist_ok=True)
+    img_dir = os.path.join(backup_dir, "images")
+    os.makedirs(img_dir, exist_ok=True)
+
+    import shutil
+
+    meta_path = os.path.join(backup_dir, "metadata.jsonl")
+    count = 0
+    with open(meta_path, "w") as f:
+        for m in image_metas:
+            # Copy image file
+            src = m.get("local_path")
+            if src and os.path.exists(src):
+                dst = os.path.join(img_dir, os.path.basename(src))
+                if not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+
+            record = {
+                "uri": m["uri"],
+                "image_pk": m["image_pk"],
+                "global_vec": m.get("global_vec"),
+                "category_l1": m.get("category_l1"),
+                "category_l2": m.get("category_l2"),
+                "product_id": m.get("product_id"),
+                "tags": m.get("tags"),
+                "local_image": os.path.basename(src) if src else None,
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            count += 1
+
+    log.info(f"Backup saved to {backup_dir}: {count} records in metadata.jsonl")
+
+
+# ── 9. Main ──────────────────────────────────────────────────────────────────
 
 async def async_main(args):
     # ── Resume logic ────────────────────────────────────────────────────
     checkpoint = load_checkpoint() if args.resume else None
     resume_stage = checkpoint.get("stage") if checkpoint else None
     resume_done = checkpoint.get("done", 0) if checkpoint else 0
-    # Restore original args from checkpoint if resuming
     if checkpoint:
         args.url_file = checkpoint.get("url_file", args.url_file)
         args.count = checkpoint.get("count", args.count)
@@ -647,17 +718,19 @@ async def async_main(args):
     log.info(f"=== Batch Import: {args.count} clothing images ===")
     log.info(f"Milvus: {MILVUS_HOST}:{MILVUS_PORT}, Collection: {COLLECTION_NAME}")
     log.info(f"Partition: {PARTITION_NAME}, ts_month: {TS_MONTH}")
+    if args.proxies:
+        log.info(f"Proxies: {args.proxies}")
+    if args.backup_dir:
+        log.info(f"Backup dir: {args.backup_dir}")
 
     STAGES = ["collect", "download", "extract", "milvus", "pg", "kafka"]
 
     def at_or_past_stage(stage: str) -> bool:
-        """Return True if the checkpoint stage is at or past the given stage."""
         if not resume_stage:
             return False
         return STAGES.index(resume_stage) >= STAGES.index(stage)
 
     def past_stage(stage: str) -> bool:
-        """Return True if the checkpoint stage is strictly past the given stage."""
         if not resume_stage:
             return False
         return STAGES.index(resume_stage) > STAGES.index(stage)
@@ -677,21 +750,18 @@ async def async_main(args):
     )
 
     if checkpoint and at_or_past_stage("download") and download_dir_has_images:
-        # Case 1: checkpoint says download is done, use local images
         log.info(f"Resuming past download stage, using local images from {args.download_dir}")
         image_metas = collect_image_urls_from_local(args.download_dir, args.count)
         log.info(f"Found {len(image_metas)} local images")
         emit_progress("download", len(image_metas), len(image_metas),
                        f"Using {len(image_metas)} already-downloaded images")
     elif checkpoint and not url_file_available and download_dir_has_images:
-        # Case 2: URL file deleted but images still on disk
         log.info(f"URL file missing ({args.url_file}), using {args.download_dir}")
         image_metas = collect_image_urls_from_local(args.download_dir, args.count)
         log.info(f"Found {len(image_metas)} local images")
         emit_progress("download", len(image_metas), len(image_metas),
                        f"Using {len(image_metas)} already-downloaded images")
     else:
-        # Normal flow: collect URLs, then download
         emit_progress("collect", 0, args.count, "Collecting image URLs...")
         image_metas = await collect_image_urls(args.count, args.local_dir, args.url_file)
         log.info(f"Collected {len(image_metas)} image URLs/paths")
@@ -704,9 +774,10 @@ async def async_main(args):
 
         _save_ckpt("collect", len(image_metas))
 
-        # Download images (already-downloaded are auto-skipped by file exists check)
         emit_progress("download", 0, len(image_metas), "Downloading images...")
-        image_metas = await download_images(image_metas, args.download_dir)
+        image_metas = await download_images(
+            image_metas, args.download_dir, proxies_str=args.proxies,
+        )
         image_metas = [m for m in image_metas if m.get("local_path")]
         log.info(f"Have {len(image_metas)} images ready for processing")
         emit_progress("download", len(image_metas), len(image_metas), f"Downloaded {len(image_metas)} images")
@@ -722,7 +793,6 @@ async def async_main(args):
     enrich_metadata(image_metas)
 
     # Step 4: Extract features
-    # On resume past extract, skip (but we always re-extract since vectors are in memory only)
     emit_progress("extract", 0, len(image_metas), "Loading CLIP model...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -738,7 +808,7 @@ async def async_main(args):
     emit_progress("extract", len(image_metas), len(image_metas), f"Extracted features for {len(image_metas)} images")
     _save_ckpt("extract", len(image_metas))
 
-    # Step 5: Write to Milvus (upsert is idempotent, safe to re-run)
+    # Step 5: Write to Milvus
     if past_stage("milvus"):
         log.info("Skipping Milvus insert (already done in previous run)")
     else:
@@ -747,7 +817,7 @@ async def async_main(args):
         emit_progress("milvus", len(image_metas), len(image_metas), "Milvus insert complete")
         _save_ckpt("milvus", len(image_metas))
 
-    # Step 6: Write to PostgreSQL (ON CONFLICT DO NOTHING, idempotent)
+    # Step 6: Write to PostgreSQL (with URI)
     if past_stage("pg"):
         log.info("Skipping PG insert (already done in previous run)")
     else:
@@ -761,6 +831,10 @@ async def async_main(args):
         emit_kafka_events(image_metas)
     else:
         log.info("Skipping Kafka events (--skip-kafka)")
+
+    # Step 8: Local backup (optional)
+    if args.backup_dir:
+        save_backup(image_metas, args.backup_dir)
 
     clear_checkpoint()
     log.info(f"=== Import complete: {len(image_metas)} images ===")
@@ -778,14 +852,19 @@ def main():
     parser.add_argument("--download-dir", type=str, default="/tmp/clothing_images",
                         help="Directory to download images to")
     parser.add_argument("--model-path", type=str,
-                        default="/home/zzc/open_clip_model.safetensors",
-                        help="Local path to CLIP model weights (.safetensors)")
+                        default=os.path.expanduser("~/ViT-B-32.pt"),
+                        help="Local path to CLIP model weights")
     parser.add_argument("--skip-kafka", action="store_true",
                         help="Skip Kafka merchant events")
     parser.add_argument("--device", type=str, default="cuda",
                         help="PyTorch device (cuda/cpu)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from last checkpoint")
+    parser.add_argument("--proxies", type=str, default=None,
+                        help="Comma-separated SOCKS5 proxy URLs "
+                             "(e.g. socks5://127.0.0.1:61081,socks5://127.0.0.1:61082)")
+    parser.add_argument("--backup-dir", type=str, default=None,
+                        help="Local backup directory (images + metadata.jsonl)")
     args = parser.parse_args()
 
     asyncio.run(async_main(args))
