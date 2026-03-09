@@ -221,6 +221,8 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         },
+        maxRedirects: 5,
+        validateStatus: (status: number) => status >= 200 && status < 300,
       };
       if (proxyUrl) {
         const agent = new SocksProxyAgent(proxyUrl);
@@ -229,7 +231,18 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
       }
 
       const resp = await axios.get(url, axiosOpts);
-      fs.writeFileSync(localPath, Buffer.from(resp.data));
+      const buf = Buffer.from(resp.data);
+
+      // Validate: must be at least 1KB and look like an image (magic bytes)
+      if (buf.length < 1024) {
+        throw new Error(`Downloaded content too small (${buf.length} bytes), likely error page`);
+      }
+      const ct = (resp.headers['content-type'] || '').toLowerCase();
+      if (ct && !ct.startsWith('image/') && !ct.startsWith('application/octet-stream')) {
+        throw new Error(`Non-image content-type: ${ct}`);
+      }
+
+      fs.writeFileSync(localPath, buf);
       return `${config.uploadUrlBase}/uploads/${filename}`;
     };
 
@@ -265,13 +278,16 @@ router.post('/file-import', txtUpload.single('file'), async (req, res) => {
             stats.succeeded++;
             return { success: true, image_id: resp.data.image_id };
           } catch (e: any) {
+            const errMsg = e.response?.data?.detail?.error?.message || e.response?.data?.message || e.message || String(e);
+            const statusCode = e.response?.status || 'N/A';
             if (attempt < maxRetries) {
+              console.warn(`[file-import] retry ${attempt + 1}/${maxRetries} ch=${chIdx} status=${statusCode} url=${url} err=${errMsg}`);
               await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
               continue;
             }
-            const msg = e.response?.data?.detail?.error?.message || e.response?.data?.message || e.message;
+            console.error(`[file-import] FAILED ch=${chIdx} status=${statusCode} url=${url} err=${errMsg}`);
             stats.failed++;
-            return { success: false, error: `[${channelLabels[chIdx]}] ${msg}` };
+            return { success: false, error: `[${channelLabels[chIdx]}] ${errMsg}` };
           }
         }
         return { success: false, error: 'unreachable' };

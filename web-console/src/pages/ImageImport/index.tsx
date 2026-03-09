@@ -228,7 +228,7 @@ function FileImport() {
   const [channelConcurrency, setChannelConcurrency] = useState(2);
   const [retries, setRetries] = useState(2);
   const [skipKafka, setSkipKafka] = useState(true);
-  const [proxies, setProxies] = useState('socks5://127.0.0.1:61081\nsocks5://127.0.0.1:61082');
+  const [proxies, setProxies] = useState('socks5://172.21.0.1:61081\nsocks5://172.21.0.1:61082');
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<FileImportProgress | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -374,7 +374,7 @@ function FileImport() {
             rows={3}
             value={proxies}
             onChange={(e) => setProxies(e.target.value)}
-            placeholder="socks5://127.0.0.1:61081&#10;socks5://127.0.0.1:61082"
+            placeholder="socks5://172.21.0.1:61081&#10;socks5://172.21.0.1:61082"
             style={{ fontFamily: 'monospace', fontSize: 12 }}
           />
         </Form.Item>
