@@ -197,6 +197,52 @@ class MilvusSearchClient:
         """标签召回 (Fallback 路径)"""
         return await self.search_by_tags_inverted(tags, top_k, "ts_month >= 0")
 
+    async def query_by_pks(
+        self,
+        pks: List[str],
+        output_fields: Optional[List[str]] = None,
+    ) -> List[dict]:
+        """v1.4: 按 pk 列表批量取向量和标量数据
+
+        用于小商家暴力搜索路径: bitmap 预查 pk → Milvus 取向量 → 进程内暴力搜索
+        """
+        if not pks:
+            return []
+
+        if output_fields is None:
+            output_fields = [
+                "image_pk", "global_vec", "product_id", "is_evergreen",
+                "category_l1", "category_l2", "tags",
+            ]
+
+        loop = asyncio.get_event_loop()
+
+        # 分批查询, 避免单次 IN 过大 (每批最多 1000 个 pk)
+        batch_size = 1000
+        all_results = []
+        for i in range(0, len(pks), batch_size):
+            batch_pks = pks[i:i + batch_size]
+            pk_list_str = ", ".join(f'"{pk}"' for pk in batch_pks)
+            expr = f"image_pk in [{pk_list_str}]"
+
+            async def _do_query(e=expr):
+                return await loop.run_in_executor(
+                    self._executor,
+                    lambda: self._hot.query(
+                        expr=e,
+                        output_fields=output_fields,
+                        limit=len(batch_pks),
+                    ),
+                )
+
+            try:
+                results = await self._breaker_hot.call_async(_do_query())
+                all_results.extend(results)
+            except Exception as e:
+                logger.warning("query_by_pks_batch_failed", batch=i, error=str(e))
+
+        return all_results
+
     @staticmethod
     def _safe_get(entity, field, default=None):
         """Safely get a field from a Milvus Hit entity."""

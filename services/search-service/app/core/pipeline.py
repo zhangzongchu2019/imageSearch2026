@@ -1,23 +1,23 @@
 """
-级联检索流水线 — v1.5 召回率优先 + 调用前缩小范围
-Stage 0   : 降级覆盖 + merchant_scope 解析 + bitmap 预构建 (与 Stage 1 并行)
+级联检索流水线 — v1.4 自适应搜索 + 子图并行 + 匹配层级
+Stage 0   : 降级覆盖 + merchant_scope 解析 + 商家规模判定
+Stage 0.5 : bitmap 预查 pk / 预构建 (与 Stage 1 并行)
 Stage 1   : 特征提取 (TensorRT FP16, GPU→CPU fallback)
-Stage 1.5+2-H : 标签召回 + 热区 HNSW ANN **并行执行**
-Stage 2-NH: [级联] 非热区 DiskANN (MD=64, SL=200)
-Stage 3   : 商家过滤 (Roaring Bitmap, 使用预构建 bitmap)
-Stage 4   : Refine 精排 (float32, 3000 候选)
-Stage 5-7 : [条件] Fallback 子图+标签多路召回
-Stage 8   : 响应构建 + 异步日志
+            ┌── 小范围路径 ──────────── 大范围路径 ──┐
+Stage 2   : Milvus pk取向量+暴力搜索    ANN+标签并行   │
+Stage 2-NH: (不需要级联)               [级联] DiskANN  │
+Stage 3   : (不需要bitmap)             bitmap后过滤    │
+            └─────────────┬────────────────────────────┘
+Stage 4   : 全局 + 子图 **双路并行** + Refine 精排
+Stage 5   : 匹配层级 P0/P1/P2 + SPU 聚合
+Stage 6   : 响应构建 + 异步日志
 
-v1.5 优化原则:
+v1.4 架构原则:
   - 召回率和准确性优先, 执行时间次之
-  - 能在调用前缩小范围就先缩小范围:
-    · bitmap 预构建与特征提取并行 (省去串行等待)
-    · 标签召回与热区 ANN 并行 (两者独立, 无需串行)
-    · 商家范围自适应 coarse_top_k (有过滤时放大候选池)
-    · 类目预过滤: 特征提取的 category 预测写入 Milvus expr (缩小搜索空间)
-  - P0-A: Milvus 熔断器异常 → 返回空结果 (降级安全)
-  - P0-C: bitmap 全不可用 (filter_skipped=True) → 联动 FSM 强制 S2
+  - 能在调用前缩小范围就先缩小范围
+  - 自适应搜索: 小商家 bitmap预查+暴力搜索, 大范围 ANN+bitmap后过滤
+  - 子图搜索为必备并行路径, 非可选 fallback
+  - 结果按匹配层级 P0>P1>P2 分层排序
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import mmh3
+import numpy as np
 import structlog
 
 from app.core.config import get_settings
@@ -38,10 +38,12 @@ from app.model.schemas import (
     DegradeState,
     EffectiveParams,
     EffectiveParamsSnapshot,
+    MatchLevel,
     SearchMeta,
     SearchRequest,
     SearchResponse,
     SearchResultItem,
+    SearchStrategy,
     Strategy,
     TimeRange,
 )
@@ -59,10 +61,11 @@ class PipelineContext:
     start_ns: int = field(default_factory=time.monotonic_ns)
     timings: Dict[str, int] = field(default_factory=dict)
     degrade_state: DegradeState = DegradeState.S0
-    degrade_reason: Optional[str] = None  # FIX-G: timeout|overload|dependency|bitmap_skip|manual
+    degrade_reason: Optional[str] = None
     degraded: bool = False
     filter_skipped: bool = False
     strategy: Strategy = Strategy.FAST_PATH
+    search_strategy: SearchStrategy = SearchStrategy.BRUTE_FORCE
     zone_hit: str = "hot"
 
     def timer_start(self, stage: str) -> int:
@@ -88,7 +91,7 @@ class Candidate:
     category_l1: Optional[int] = None
     category_l2: Optional[int] = None
     tags: Optional[List[int]] = None
-    source: str = "hot_ann"  # hot_ann | non_hot_ann | tag_recall | sub_image
+    source: str = "hot_ann"  # hot_ann | non_hot_ann | tag_recall | sub_image | brute_force
 
 
 from app.engine.feature_extractor import FeatureResult
@@ -97,30 +100,29 @@ from app.engine.feature_extractor import FeatureResult
 # ── 核心流水线 ──
 
 class SearchPipeline:
-    """级联检索流水线 — 所有 Stage 均可独立降级
+    """v1.4 自适应检索流水线
 
-    v1.4 关键变更:
-    - P0-A: Milvus 熔断 → 安全返回空列表
-    - P0-C: bitmap 连续跳过 >= 3 次 → 强制 FSM S2
-    - 两区架构: 热区 HNSW + 非热区 DiskANN
-    - 双路径: 快路径 ≤240ms (80%) + 级联路径 ≤400ms (20%)
+    根据商家范围大小自动选择最优搜索策略:
+    - 小范围 (pk ≤ brute_force_pk_limit): bitmap 预查 pk → Milvus 取向量 → 暴力搜索
+    - 大范围: Milvus ANN 粗召回 → bitmap 后过滤
+    - 子图搜索为必备并行路径
     """
 
-    # bitmap 连续跳过阈值 → 触发 FSM 强制降级
     BITMAP_SKIP_FORCE_DEGRADE_THRESHOLD = 3
+    MERCHANT_SCOPE_TOP_K_MULTIPLIER = 1.5
 
     def __init__(
         self,
         degrade_fsm: DegradeStateMachine,
-        feature_extractor,  # FeatureExtractor
-        ann_searcher,       # ANNSearcher
-        bitmap_filter,      # BitmapFilterClient
-        refiner,            # Refiner
-        ranker,             # FusionRanker
-        scope_resolver,     # ScopeResolver
-        vocab_cache,        # VocabCache
-        search_logger,      # SearchLogEmitter
-        pg_pool=None,       # asyncpg Pool for URI lookup
+        feature_extractor,
+        ann_searcher,
+        bitmap_filter,
+        refiner,
+        ranker,
+        scope_resolver,
+        vocab_cache,
+        search_logger,
+        pg_pool=None,
     ):
         self._degrade = degrade_fsm
         self._feature = feature_extractor
@@ -132,49 +134,189 @@ class SearchPipeline:
         self._vocab = vocab_cache
         self._logger = search_logger
         self._pg_pool = pg_pool
-
-        # P0-C: bitmap 连续跳过计数器
         self._bitmap_skip_consecutive = 0
 
-    # ── 自适应 coarse_top_k: 有商家过滤时放大候选池, 补偿后续过滤损耗 ──
-    MERCHANT_SCOPE_TOP_K_MULTIPLIER = 1.5
+    # ════════════════════════════════════════════════════════════
+    # 主入口
+    # ════════════════════════════════════════════════════════════
 
     async def execute(self, req: SearchRequest, request_id: str) -> SearchResponse:
         ctx = PipelineContext(request_id=request_id)
 
-        # ── Stage 0: 降级状态覆盖 + Scope 解析 ──
+        # ── Stage 0: 降级覆盖 + Scope 解析 ──
         params = self._degrade.apply(req)
         ctx.degrade_state = self._degrade.state
         ctx.degraded = self._degrade.state not in (DegradeState.S0, DegradeState.S3)
-        ctx.degrade_reason = self._degrade.last_reason if ctx.degraded else None  # FIX-G
+        ctx.degrade_reason = self._degrade.last_reason if ctx.degraded else None
 
         if req.merchant_scope_id and not params.merchant_scope:
             params.merchant_scope = await self._scope.resolve(req.merchant_scope_id)
 
-        # ── v1.5: 特征提取 + bitmap 预构建 **并行** ──
-        # 原则: 能在调用前缩小范围就先缩小范围
-        # bitmap 构建需要 PG/Redis 查询, 与 GPU 推理无依赖, 可并行
-        bitmap_prebuild_task = None
-        if params.merchant_scope and hasattr(self._bitmap, '_bitmap_builder'):
-            bitmap_prebuild_task = asyncio.create_task(
-                self._bitmap._bitmap_builder.build(params.merchant_scope)
-            )
+        # ── Stage 0.5: 商家规模判定 + bitmap 预查 (与特征提取并行) ──
+        use_brute_force = False
+        prefetch_task = None
+        if params.merchant_scope:
+            t = ctx.timer_start("merchant_count")
+            image_count = await self._bitmap.get_merchant_image_count(params.merchant_scope)
+            ctx.timer_end("merchant_count", t)
 
+            brute_force_limit = getattr(settings, 'adaptive_search', None)
+            limit = brute_force_limit.brute_force_pk_limit if brute_force_limit else 1_000_000
+
+            if image_count <= limit:
+                use_brute_force = True
+                ctx.search_strategy = SearchStrategy.BRUTE_FORCE
+                # 并行预查 pk 列表
+                prefetch_task = asyncio.create_task(
+                    self._bitmap.get_merchant_image_pks(params.merchant_scope)
+                )
+            else:
+                ctx.search_strategy = SearchStrategy.HNSW_FILTERED
+                # 大范围: 并行预构建 bitmap
+                if hasattr(self._bitmap, '_bitmap_builder'):
+                    prefetch_task = asyncio.create_task(
+                        self._bitmap._bitmap_builder.build(params.merchant_scope)
+                    )
+
+        # ── Stage 1: 特征提取 (与 bitmap 预查并行) ──
         t = ctx.timer_start("feature")
         features = await self._extract_features(req.query_image)
         ctx.timer_end("feature", t)
 
-        # ── v1.5: 自适应 coarse_top_k ──
-        # 有商家过滤时, 放大候选池以补偿后续过滤损耗, 保证最终召回量
+        # ── 分路执行 ──
+        if use_brute_force:
+            all_candidates = await self._execute_brute_force_path(
+                ctx, features, params, prefetch_task
+            )
+        else:
+            all_candidates = await self._execute_ann_path(
+                ctx, features, params, prefetch_task
+            )
+
+        # ── Stage 4: 子图并行搜索 (v1.4: 必备路径, 非 fallback) ──
+        if features.sub_vecs and settings.feature_flags.enable_sub_image_search:
+            t = ctx.timer_start("sub_image")
+            sub_candidates = await self._search_sub_images(features)
+            ctx.timer_end("sub_image", t)
+            all_candidates = self._merge_with_sub(all_candidates, sub_candidates)
+
+        # ── Stage 4b: Refine 精排 ──
+        if settings.feature_flags.enable_refine and all_candidates:
+            t = ctx.timer_start("refine")
+            all_candidates = await self._refiner.rerank(
+                query_vec=features.global_vec,
+                candidates=all_candidates[: params.refine_top_k],
+            )
+            ctx.timer_end("refine", t)
+
+        # ── Stage 5: 匹配层级分类 + SPU 聚合 ──
+        all_candidates = self._classify_match_level(all_candidates)
+        all_candidates = self._aggregate_by_spu(all_candidates)
+
+        # ── 终极兜底 ──
+        if not all_candidates:
+            all_candidates = await self._ultimate_fallback(ctx, features, params)
+
+        # ── Stage 6: 响应构建 ──
+        response = await self._build_response(ctx, all_candidates, params, features)
+
+        asyncio.create_task(self._logger.emit(ctx, params, features, response))
+
+        METRICS.search_total.labels(
+            strategy=ctx.strategy.value,
+            confidence=response.meta.confidence.value,
+        ).inc()
+
+        return response
+
+    # ════════════════════════════════════════════════════════════
+    # 小范围路径: bitmap 预查 pk → Milvus 取向量 → 暴力搜索
+    # ════════════════════════════════════════════════════════════
+
+    async def _execute_brute_force_path(
+        self,
+        ctx: PipelineContext,
+        features: FeatureResult,
+        params: EffectiveParams,
+        prefetch_task: Optional[asyncio.Task],
+    ) -> List[Candidate]:
+        """小商家路径: 精度 100%, 延迟 < 10ms"""
+        # 等待 pk 列表预查完成
+        image_pks: List[str] = []
+        if prefetch_task:
+            t = ctx.timer_start("bitmap_prefetch")
+            try:
+                image_pks = await prefetch_task
+            except Exception as e:
+                logger.error("bitmap_prefetch_failed", error=str(e))
+            ctx.timer_end("bitmap_prefetch", t)
+
+        if not image_pks:
+            return []
+
+        # Milvus 按 pk 批量取向量
+        t = ctx.timer_start("query_by_pk")
+        records = await self._ann.query_by_pks(image_pks)
+        ctx.timer_end("query_by_pk", t)
+
+        if not records:
+            return []
+
+        # 进程内暴力计算 cosine distance
+        t = ctx.timer_start("brute_force")
+        candidates = self._brute_force_cosine(features.global_vec, records)
+        ctx.timer_end("brute_force", t)
+
+        return candidates
+
+    @staticmethod
+    def _brute_force_cosine(query_vec: List[float], records: List[dict]) -> List[Candidate]:
+        """进程内暴力计算 cosine similarity"""
+        q = np.array(query_vec, dtype=np.float32)
+        q_norm = q / (np.linalg.norm(q) + 1e-10)
+
+        candidates = []
+        for r in records:
+            vec = r.get("global_vec")
+            if vec is None:
+                continue
+            v = np.array(vec, dtype=np.float32)
+            v_norm = v / (np.linalg.norm(v) + 1e-10)
+            score = float(np.dot(q_norm, v_norm))
+            candidates.append(Candidate(
+                image_pk=r.get("image_pk", ""),
+                score=score,
+                product_id=r.get("product_id"),
+                is_evergreen=r.get("is_evergreen", False),
+                category_l1=r.get("category_l1"),
+                category_l2=r.get("category_l2"),
+                tags=r.get("tags"),
+                source="brute_force",
+            ))
+
+        candidates.sort(key=lambda x: x.score, reverse=True)
+        return candidates
+
+    # ════════════════════════════════════════════════════════════
+    # 大范围路径: ANN + bitmap 后过滤
+    # ════════════════════════════════════════════════════════════
+
+    async def _execute_ann_path(
+        self,
+        ctx: PipelineContext,
+        features: FeatureResult,
+        params: EffectiveParams,
+        prefetch_task: Optional[asyncio.Task],
+    ) -> List[Candidate]:
+        """大范围路径: ANN 粗召回 + bitmap 后过滤"""
+
         coarse_top_k = settings.search.ann.coarse_top_k
         if params.merchant_scope:
             coarse_top_k = int(coarse_top_k * self.MERCHANT_SCOPE_TOP_K_MULTIPLIER)
 
-        # ── v1.5: 类目预过滤 — 特征提取的 category 预测写入 Milvus expr ──
         category_filter = self._build_category_prefilter(features)
 
-        # ── v1.5: 标签召回 + 热区 ANN **并行执行** ──
-        # 两者都依赖 features, 但互相独立, 并行可节省 10-20ms
+        # 标签召回 + 热区 ANN 并行
         tag_recall_task = None
         if settings.feature_flags.enable_tag_recall_stage and features.tags_pred:
             tag_recall_task = asyncio.create_task(
@@ -182,12 +324,9 @@ class SearchPipeline:
             )
 
         t = ctx.timer_start("ann_hot")
-        hot_candidates = await self._search_hot_zone(
-            features, params, coarse_top_k, category_filter
-        )
+        hot_candidates = await self._search_hot_zone(features, params, coarse_top_k, category_filter)
         ctx.timer_end("ann_hot", t)
 
-        # 收集并行标签召回结果
         tag_recall_candidates: List[Candidate] = []
         if tag_recall_task is not None:
             t_tag = ctx.timer_start("tag_recall")
@@ -197,7 +336,7 @@ class SearchPipeline:
                 logger.warning("tag_recall_parallel_error", error=str(e))
             ctx.timer_end("tag_recall", t_tag)
 
-        # ── 级联判定: Top1 score < cascade_trigger ──
+        # 级联判定
         top1_score = hot_candidates[0].score if hot_candidates else 0.0
         cascade_trigger = settings.search.dual_path.cascade_trigger
         non_hot_candidates: List[Candidate] = []
@@ -206,33 +345,25 @@ class SearchPipeline:
             top1_score < cascade_trigger
             and params.enable_cascade
             and not ctx.degraded
-            and params.time_range == TimeRange.ALL  # 仅 ALL 才触发非热区级联
+            and params.time_range == TimeRange.ALL
             and params.data_scope in (DataScope.ALL, DataScope.ROLLING)
         ):
-            # ── Stage 2-NH: 非热区 DiskANN 检索 (级联路径) ──
             t = ctx.timer_start("ann_non_hot")
-            non_hot_candidates = await self._search_non_hot_zone(
-                features, params, coarse_top_k
-            )
+            non_hot_candidates = await self._search_non_hot_zone(features, params, coarse_top_k)
             ctx.timer_end("ann_non_hot", t)
             ctx.strategy = Strategy.CASCADE_PATH
             ctx.zone_hit = "hot+non_hot"
-
             METRICS.cascade_triggered_total.inc()
 
-        # ── 合并候选集 ──
-        all_candidates = self._merge_candidates(
-            hot_candidates, non_hot_candidates, tag_recall_candidates
-        )
+        all_candidates = self._merge_candidates(hot_candidates, non_hot_candidates, tag_recall_candidates)
 
-        # ── Stage 3: 商家过滤 (使用预构建的 bitmap) ──
+        # bitmap 后过滤
         if params.merchant_scope:
-            # 等待预构建完成 (通常此时已完成, 因为特征提取+ANN 耗时更长)
-            if bitmap_prebuild_task is not None:
+            if prefetch_task is not None:
                 try:
-                    await bitmap_prebuild_task
+                    await prefetch_task
                 except Exception:
-                    pass  # bitmap 构建失败由 filter_with_degrade 内部降级处理
+                    pass
 
             t = ctx.timer_start("filter")
             all_candidates, filter_skipped = await self._bitmap.filter_with_degrade(
@@ -243,12 +374,9 @@ class SearchPipeline:
             ctx.filter_skipped = filter_skipped
             ctx.timer_end("filter", t)
 
-            # ── P0-C: bitmap 全不可用 → 联动 FSM 强制降级 ──
             if filter_skipped:
                 self._bitmap_skip_consecutive += 1
-                METRICS.bitmap_filter_fallback.labels(
-                    level="skip", reason="all_levels_failed"
-                ).inc()
+                METRICS.bitmap_filter_fallback.labels(level="skip", reason="all_levels_failed").inc()
                 if self._bitmap_skip_consecutive >= self.BITMAP_SKIP_FORCE_DEGRADE_THRESHOLD:
                     current_state = self._degrade.state
                     if current_state in (DegradeState.S0, DegradeState.S1):
@@ -256,85 +384,99 @@ class SearchPipeline:
                             DegradeState.S2,
                             reason=f"bitmap_filter_skipped_{self._bitmap_skip_consecutive}_consecutive",
                         )
-                        logger.error(
-                            "bitmap_skip_force_degrade",
-                            consecutive=self._bitmap_skip_consecutive,
-                            forced_state="S2",
-                        )
+                        logger.error("bitmap_skip_force_degrade", consecutive=self._bitmap_skip_consecutive)
             else:
-                self._bitmap_skip_consecutive = 0  # 重置计数器
+                self._bitmap_skip_consecutive = 0
 
-        # ── Stage 4: Refine 精排 ──
-        if settings.feature_flags.enable_refine and all_candidates:
-            t = ctx.timer_start("refine")
-            all_candidates = await self._refiner.rerank(
-                query_vec=features.global_vec,
-                candidates=all_candidates[: params.refine_top_k],
+        return all_candidates
+
+    # ════════════════════════════════════════════════════════════
+    # 子图并行搜索 (v1.4: 必备路径)
+    # ════════════════════════════════════════════════════════════
+
+    async def _search_sub_images(self, features: FeatureResult) -> List[Candidate]:
+        """v1.4: 子图搜索为必备并行路径, 每次搜索都执行"""
+        try:
+            return await asyncio.wait_for(
+                self._ann.search_sub(
+                    features.sub_vecs,
+                    top_k=settings.search.fallback.sub_image_top_k,
+                ),
+                timeout=0.1,  # 100ms 超时
             )
-            ctx.timer_end("refine", t)
+        except Exception as e:
+            logger.warning("sub_image_search_failed", error=str(e))
+            return []
 
-        # ── Stage 5-7: 条件 Fallback (子图+标签多路召回) ──
-        # v4.1: 基于 top1_score 触发, 阈值降至 0.70 更积极召回
-        top1_after_refine = all_candidates[0].score if all_candidates else 0.0
-        if (
-            params.enable_fallback
-            and (
-                not all_candidates
-                or top1_after_refine < settings.search.fallback.score_threshold
-            )
-        ):
-            fallback_results = await self._fallback(features, params)
-            all_candidates = self._ranker.fuse(
-                all_candidates, fallback_results, [], features
-            )
+    @staticmethod
+    def _merge_with_sub(main: List[Candidate], sub: List[Candidate]) -> List[Candidate]:
+        """合并主结果和子图结果, 按 image_pk 去重取最高分"""
+        seen: Dict[str, Candidate] = {}
+        for c in main:
+            if c.image_pk not in seen or c.score > seen[c.image_pk].score:
+                seen[c.image_pk] = c
+        for c in sub:
+            c.source = "sub_image"
+            if c.image_pk not in seen or c.score > seen[c.image_pk].score:
+                seen[c.image_pk] = c
+        result = list(seen.values())
+        result.sort(key=lambda x: x.score, reverse=True)
+        return result
 
-        # ── FIX-E: 终极兜底 — 所有召回路径均为空时返回热门/常青推荐 ──
-        if not all_candidates:
-            METRICS.error_code_total.labels(code="empty_result_fallback", source="internal").inc()
-            logger.warning(
-                "empty_result_ultimate_fallback",
-                request_id=ctx.request_id,
-                degrade_state=ctx.degrade_state.value,
-            )
-            try:
-                all_candidates = await asyncio.wait_for(
-                    self._ann.search_hot(
-                        vector=features.global_vec,
-                        partition_filter="is_evergreen == true",
-                        ef_search=96,
-                        top_k=min(params.top_k, 50),
-                    ),
-                    timeout=0.3,
-                )
-            except Exception:
-                pass  # 终极兜底失败仍返回空结果
+    # ════════════════════════════════════════════════════════════
+    # 匹配层级 + SPU 聚合 (v1.4 新增)
+    # ════════════════════════════════════════════════════════════
 
-        # ── Stage 8: 响应构建 ──
-        response = await self._build_response(ctx, all_candidates, params, features)
+    @staticmethod
+    def _classify_match_level(candidates: List[Candidate]) -> List[Candidate]:
+        """v1.4: 按相似度分数分类匹配层级 P0>P1>P2"""
+        try:
+            p0_th = settings.match_level.p0_threshold
+            p1_th = settings.match_level.p1_threshold
+        except AttributeError:
+            p0_th, p1_th = 0.90, 0.70
 
-        # 异步写搜索日志
-        asyncio.create_task(
-            self._logger.emit(ctx, params, features, response)
-        )
+        for c in candidates:
+            if c.score >= p0_th:
+                c._match_level = MatchLevel.P0
+            elif c.score >= p1_th:
+                c._match_level = MatchLevel.P1
+            else:
+                c._match_level = MatchLevel.P2
+        return candidates
 
-        METRICS.search_total.labels(
-            strategy=ctx.strategy.value,
-            confidence=response.meta.confidence.value,
-        ).inc()
+    @staticmethod
+    def _aggregate_by_spu(candidates: List[Candidate]) -> List[Candidate]:
+        """v1.4: 按 product_id (SPU) 聚合, 同商品取最高分图片"""
+        if not candidates:
+            return candidates
 
-        return response
+        seen_products: Dict[str, Candidate] = {}
+        no_product: List[Candidate] = []
 
-    # ── 内部方法 ──
+        for c in candidates:
+            if not c.product_id:
+                no_product.append(c)
+                continue
+            if c.product_id not in seen_products or c.score > seen_products[c.product_id].score:
+                seen_products[c.product_id] = c
+
+        # P0 优先, 然后 P1, 然后 P2; 同层级按分数降序
+        result = list(seen_products.values()) + no_product
+        level_order = {MatchLevel.P0: 0, MatchLevel.P1: 1, MatchLevel.P2: 2}
+        result.sort(key=lambda c: (level_order.get(getattr(c, '_match_level', MatchLevel.P2), 2), -c.score))
+        return result
+
+    # ════════════════════════════════════════════════════════════
+    # 内部方法 (保留原有)
+    # ════════════════════════════════════════════════════════════
 
     async def _extract_features(self, query_image_b64: str) -> FeatureResult:
-        """特征提取 — 远程推理服务 / GPU / CPU fallback"""
-        # 远程推理模式: 超时更宽松 (网络 + 模型推理)
         if self._feature._use_remote:
             return await asyncio.wait_for(
                 self._feature.extract_query(query_image_b64),
                 timeout=30.0,
             )
-        # 本地 GPU 推理, 30ms 超时后降级 CPU (10 QPS 限流)
         try:
             return await asyncio.wait_for(
                 self._feature.extract_query(query_image_b64, device="gpu"),
@@ -346,18 +488,10 @@ class SearchPipeline:
             logger.warning("gpu_fallback", error=str(e))
             return await self._feature.extract_query(query_image_b64, device="cpu")
 
-    async def _tag_recall(
-        self, features: FeatureResult, params: EffectiveParams
-    ) -> List[Candidate]:
-        """Stage 1.5: 全量标签召回 — IDF Top-5 + 10ms 硬超时
-
-        v4.0.1 Patch #4: 截断保护, 防止标签过多导致延迟爆炸
-        """
-        # IDF Top-5 截断: 只取区分度最高的 5 个标签
+    async def _tag_recall(self, features: FeatureResult, params: EffectiveParams) -> List[Candidate]:
         top_tags = features.tags_pred[: settings.search.tag_recall.idf_top_k]
         if not top_tags:
             return []
-
         timeout_s = settings.search.tag_recall.timeout_ms / 1000
         try:
             return await asyncio.wait_for(
@@ -370,29 +504,15 @@ class SearchPipeline:
             )
         except asyncio.TimeoutError:
             METRICS.tag_recall_timeout_total.inc()
-            logger.warning("tag_recall_timeout", tags_count=len(top_tags))
             return []
 
-    async def _search_hot_zone(
-        self,
-        features: FeatureResult,
-        params: EffectiveParams,
-        coarse_top_k: int = 0,
-        category_filter: str = "",
-    ) -> List[Candidate]:
-        """热区 HNSW 检索 — M=24, ef=256, P99 ≤200ms
-        v1.5: 支持自适应 coarse_top_k + 类目预过滤
-        P0-A: 熔断器打开 → 返回空列表 (安全降级)
-        """
+    async def _search_hot_zone(self, features, params, coarse_top_k=0, category_filter=""):
         from app.core.circuit_breaker import CircuitBreakerOpenError
         effective_top_k = coarse_top_k or settings.search.ann.coarse_top_k
         timeout_s = settings.search.ann.hot_timeout_ms / 1000
-
-        # v1.5: 类目预过滤 — 缩小搜索空间
         partition_filter = self._build_hot_partition_filter(params)
         if category_filter:
             partition_filter = f"({partition_filter}) and ({category_filter})"
-
         try:
             return await asyncio.wait_for(
                 self._ann.search_hot(
@@ -403,27 +523,11 @@ class SearchPipeline:
                 ),
                 timeout=timeout_s,
             )
-        except CircuitBreakerOpenError:
+        except (CircuitBreakerOpenError, asyncio.TimeoutError):
             METRICS.ann_timeout_total.labels(zone="hot").inc()
-            METRICS.error_code_total.labels(code="ann_breaker_open", source="milvus").inc()
-            logger.error("hot_zone_breaker_open")
-            return []
-        except asyncio.TimeoutError:
-            METRICS.ann_timeout_total.labels(zone="hot").inc()
-            METRICS.error_code_total.labels(code="ann_timeout", source="milvus").inc()
-            logger.error("hot_zone_timeout")
             return []
 
-    async def _search_non_hot_zone(
-        self,
-        features: FeatureResult,
-        params: EffectiveParams,
-        coarse_top_k: int = 0,
-    ) -> List[Candidate]:
-        """非热区 DiskANN 检索 — MD=64, SL=200, P99 ≤350ms
-        v1.5: 支持自适应 coarse_top_k
-        P0-A: 熔断器打开 → 返回空列表
-        """
+    async def _search_non_hot_zone(self, features, params, coarse_top_k=0):
         from app.core.circuit_breaker import CircuitBreakerOpenError
         effective_top_k = coarse_top_k or settings.search.ann.coarse_top_k
         timeout_s = settings.search.dual_path.cascade_timeout_ms / 1000
@@ -437,52 +541,27 @@ class SearchPipeline:
                 ),
                 timeout=timeout_s,
             )
-        except CircuitBreakerOpenError:
+        except (CircuitBreakerOpenError, asyncio.TimeoutError):
             METRICS.ann_timeout_total.labels(zone="non_hot").inc()
-            METRICS.error_code_total.labels(code="ann_breaker_open", source="milvus").inc()
-            logger.warning("non_hot_zone_breaker_open")
-            return []
-        except asyncio.TimeoutError:
-            METRICS.ann_timeout_total.labels(zone="non_hot").inc()
-            METRICS.error_code_total.labels(code="ann_timeout", source="milvus").inc()
-            logger.warning("non_hot_zone_timeout_cascade_skipped")
             return []
 
-    async def _fallback(
-        self, features: FeatureResult, params: EffectiveParams
-    ) -> List[Candidate]:
-        """子图 + 标签多路召回 Fallback"""
-        tasks = []
-        if features.sub_vecs and settings.feature_flags.enable_sub_image_search:
-            tasks.append(
-                self._ann.search_sub(
-                    features.sub_vecs,
-                    top_k=settings.search.fallback.sub_image_top_k,
-                )
+    async def _ultimate_fallback(self, ctx, features, params):
+        METRICS.error_code_total.labels(code="empty_result_fallback", source="internal").inc()
+        logger.warning("empty_result_ultimate_fallback", request_id=ctx.request_id)
+        try:
+            return await asyncio.wait_for(
+                self._ann.search_hot(
+                    vector=features.global_vec,
+                    partition_filter="is_evergreen == true",
+                    ef_search=96,
+                    top_k=min(params.top_k, 50),
+                ),
+                timeout=0.3,
             )
-        if features.tags_pred and settings.feature_flags.enable_tag_search:
-            tasks.append(
-                self._ann.search_by_tags(
-                    features.tags_pred,
-                    top_k=settings.search.fallback.tag_top_k,
-                )
-            )
-        if not tasks:
+        except Exception:
             return []
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        merged = []
-        for r in results:
-            if isinstance(r, list):
-                merged.extend(r)
-        return merged
 
-    def _merge_candidates(
-        self,
-        hot: List[Candidate],
-        non_hot: List[Candidate],
-        tag_recall: List[Candidate],
-    ) -> List[Candidate]:
-        """合并三路候选, 按 image_pk 去重取最高分"""
+    def _merge_candidates(self, hot, non_hot, tag_recall):
         seen: Dict[str, Candidate] = {}
         for c in hot:
             if c.image_pk not in seen or c.score > seen[c.image_pk].score:
@@ -499,53 +578,35 @@ class SearchPipeline:
         result.sort(key=lambda x: x.score, reverse=True)
         return result
 
-    # ── 类目预过滤 (v1.5 新增) ──
-
     @staticmethod
     def _build_category_prefilter(features: FeatureResult) -> str:
-        """v1.5: 用特征提取的类目预测缩小 Milvus 搜索空间
-
-        仅当模型对类目预测置信度较高时才启用, 避免误过滤导致召回损失。
-        使用 category_l1 (一级类目) 做粗过滤, 保留足够宽的搜索范围。
-        """
         cat_pred = getattr(features, "category_l1_pred", None)
         cat_conf = getattr(features, "category_l1_conf", 0.0)
-
-        # 仅高置信度 (>=0.85) 时启用类目预过滤, 保守策略保召回
         if cat_pred is not None and cat_conf >= 0.85:
             return f"category_l1 == {cat_pred}"
         return ""
 
-    # ── 分区过滤表达式构建 ──
+    # ── 分区过滤表达式 ──
 
     def _build_partition_filter(self, params: EffectiveParams) -> str:
-        """通用分区过滤 — 根据 data_scope + time_range 构建 Milvus expr"""
         from app.core.utils import current_yyyymm, month_subtract
         now = current_yyyymm()
-
         if params.data_scope == DataScope.EVERGREEN:
             return "is_evergreen == true"
-
-        # HOT_PLUS_EVERGREEN (降级专用): 热区 + 常青
         if params.time_range == TimeRange.HOT_PLUS_EVERGREEN:
             hot_start = month_subtract(now, settings.hot_zone.months)
             return f"(ts_month >= {hot_start}) or (is_evergreen == true)"
-
-        # HOT_ONLY: 仅热区
         if params.time_range == TimeRange.HOT_ONLY:
             hot_start = month_subtract(now, settings.hot_zone.months)
             if params.data_scope == DataScope.ROLLING:
                 return f"ts_month >= {hot_start} and is_evergreen == false"
             return f"(ts_month >= {hot_start}) or (is_evergreen == true)"
-
-        # ALL (默认): 18 个月 + 常青
         start = month_subtract(now, settings.non_hot_zone.months_end)
         if params.data_scope == DataScope.ROLLING:
             return f"ts_month >= {start} and is_evergreen == false"
         return f"(ts_month >= {start}) or (is_evergreen == true)"
 
     def _build_hot_partition_filter(self, params: EffectiveParams) -> str:
-        """热区分区过滤: ts_month >= hot_start"""
         from app.core.utils import current_yyyymm, month_subtract
         now = current_yyyymm()
         hot_start = month_subtract(now, settings.hot_zone.months)
@@ -557,7 +618,6 @@ class SearchPipeline:
         return f"({base}) or (is_evergreen == true)"
 
     def _build_non_hot_partition_filter(self, params: EffectiveParams) -> str:
-        """非热区分区过滤: non_hot_start ≤ ts_month < hot_start"""
         from app.core.utils import current_yyyymm, month_subtract
         now = current_yyyymm()
         hot_start = month_subtract(now, settings.hot_zone.months)
@@ -567,7 +627,6 @@ class SearchPipeline:
     # ── URI 查询 ──
 
     async def _batch_fetch_uris(self, image_pks: List[str]) -> Dict[str, str]:
-        """从 PG uri_dedup 批量获取 image_pk → uri 映射"""
         if not image_pks or self._pg_pool is None:
             return {}
         try:
@@ -583,20 +642,11 @@ class SearchPipeline:
 
     # ── 响应构建 ──
 
-    async def _build_response(
-        self,
-        ctx: PipelineContext,
-        candidates: List[Candidate],
-        params: EffectiveParams,
-        features: FeatureResult,
-    ) -> SearchResponse:
+    async def _build_response(self, ctx, candidates, params, features) -> SearchResponse:
         top_k = min(params.top_k, len(candidates))
         final_candidates = candidates[:top_k]
 
-        # 批量查询 image_url
-        uri_map = await self._batch_fetch_uris(
-            [c.image_pk for c in final_candidates]
-        )
+        uri_map = await self._batch_fetch_uris([c.image_pk for c in final_candidates])
 
         results = []
         for i, c in enumerate(final_candidates):
@@ -609,9 +659,10 @@ class SearchPipeline:
                     position=i + 1,
                     is_evergreen=c.is_evergreen,
                     category_l1=self._vocab.decode("category_l1", c.category_l1)
-                    if c.category_l1 is not None
-                    else None,
-                    tags=[s for t in (c.tags or []) if t is not None for s in [self._vocab.decode("tag", t)] if s is not None],
+                    if c.category_l1 is not None else None,
+                    tags=[s for t in (c.tags or []) if t is not None
+                          for s in [self._vocab.decode("tag", t)] if s is not None],
+                    match_level=getattr(c, '_match_level', None),
                 )
             )
 
@@ -627,17 +678,18 @@ class SearchPipeline:
             degraded=ctx.degraded,
             filter_skipped=ctx.filter_skipped,
             degrade_state=ctx.degrade_state,
-            degrade_reason=ctx.degrade_reason,  # FIX-G
+            degrade_reason=ctx.degrade_reason,
             search_scope_desc=scope_desc,
             latency_ms=ctx.total_ms,
             zone_hit=ctx.zone_hit,
-            effective_params=EffectiveParamsSnapshot(  # FIX-F
+            search_strategy=ctx.search_strategy,
+            effective_params=EffectiveParamsSnapshot(
                 ef_search=params.ef_search,
                 search_list_size=getattr(params, "search_list_size", None),
                 refine_top_k=params.refine_top_k,
                 time_range=params.time_range.value if params.time_range else None,
                 enable_cascade=params.enable_cascade,
-                enable_sub_image=getattr(params, "enable_sub_image", False),
+                enable_sub_image=True,
                 data_scope=params.data_scope.value if params.data_scope else None,
             ),
             feature_ms=ctx.timings.get("feature"),
@@ -665,14 +717,11 @@ class SearchPipeline:
             return "搜索范围已扩大，结果可能包含其他商家商品"
         if ctx.degraded:
             return "当前搜索范围已缩小（热区 + 经典款）"
-
-        # 范围描述
         range_desc = {
-            TimeRange.HOT_ONLY: "近5个月",
+            TimeRange.HOT_ONLY: "近6个月",
             TimeRange.ALL: "近18个月 + 经典款",
             TimeRange.HOT_PLUS_EVERGREEN: "热区 + 经典款",
         }.get(params.time_range, "全部")
-
         if params.data_scope == DataScope.EVERGREEN:
             return "经典款商品"
         if params.merchant_scope:

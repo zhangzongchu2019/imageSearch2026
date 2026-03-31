@@ -234,6 +234,73 @@ class BitmapFilterGrpcClient:
             )
             return {r["image_pk"].strip() for r in rows}
 
+    # ── v1.4: 前置预查 — 按商家查 image_pk 列表 ──
+
+    async def get_merchant_image_pks(
+        self, merchant_scope: List[str], limit: int = 0
+    ) -> List[str]:
+        """v1.4: 从 PG 查询指定商家的所有 image_pk 列表
+
+        用于小商家暴力搜索路径: bitmap 预查 pk → Milvus 取向量 → 暴力搜索
+        """
+        if not self._pg_pool or not merchant_scope:
+            return []
+
+        try:
+            async with self._pg_pool.acquire() as conn:
+                # Step 1: 商家 string → bitmap_index
+                indices = await conn.fetch(
+                    """SELECT bitmap_index FROM merchant_id_mapping
+                       WHERE merchant_string_id = ANY($1::varchar[])""",
+                    merchant_scope,
+                )
+                if not indices:
+                    return []
+                index_list = [r["bitmap_index"] for r in indices]
+
+                # Step 2: 查找包含这些商家的所有 image_pk
+                # 使用 rb_intersect 检查 bitmap 是否包含目标商家
+                query = """
+                    SELECT image_pk FROM image_merchant_bitmaps
+                    WHERE rb_intersect(bitmap_data, rb_build($1::int[]))
+                """
+                if limit > 0:
+                    query += f" LIMIT {limit}"
+
+                rows = await conn.fetch(query, index_list)
+                return [r["image_pk"].strip() for r in rows]
+        except Exception as e:
+            logger.error("get_merchant_image_pks_failed", error=str(e))
+            return []
+
+    async def get_merchant_image_count(
+        self, merchant_scope: List[str]
+    ) -> int:
+        """v1.4: 查询指定商家的图片总数 (用于自适应搜索策略判定)"""
+        if not self._pg_pool or not merchant_scope:
+            return 0
+
+        try:
+            async with self._pg_pool.acquire() as conn:
+                indices = await conn.fetch(
+                    """SELECT bitmap_index FROM merchant_id_mapping
+                       WHERE merchant_string_id = ANY($1::varchar[])""",
+                    merchant_scope,
+                )
+                if not indices:
+                    return 0
+                index_list = [r["bitmap_index"] for r in indices]
+
+                row = await conn.fetchrow(
+                    """SELECT COUNT(*) AS cnt FROM image_merchant_bitmaps
+                       WHERE rb_intersect(bitmap_data, rb_build($1::int[]))""",
+                    index_list,
+                )
+                return row["cnt"] if row else 0
+        except Exception as e:
+            logger.warning("get_merchant_image_count_failed", error=str(e))
+            return 0
+
     # ── Health Check ──
 
     async def health_check(self) -> str:

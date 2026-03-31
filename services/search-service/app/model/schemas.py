@@ -1,6 +1,6 @@
 """
 请求/响应模型 — Pydantic v2 严格校验
-对齐 BRD v4.0.1 / 系统设计 v1.2
+对齐 BRD v5.0 / 技术架构 v1.4
 """
 from __future__ import annotations
 
@@ -39,6 +39,20 @@ class Confidence(str, Enum):
 class Strategy(str, Enum):
     FAST_PATH = "fast_path"
     CASCADE_PATH = "cascade_path"
+
+
+class SearchStrategy(str, Enum):
+    """v1.4: 自适应搜索策略类型"""
+    BRUTE_FORCE = "brute_force"        # 小商家: bitmap 预查 + 暴力搜索
+    HNSW_FILTERED = "hnsw_filtered"    # SVIP/大范围: ANN + bitmap 后过滤
+    HYBRID = "hybrid"                  # 跨商家混合: 部分暴力 + 部分 ANN
+
+
+class MatchLevel(str, Enum):
+    """v1.4: 结果匹配层级"""
+    P0 = "P0"    # 原图匹配 (score > 0.90), 可直接开单
+    P1 = "P1"    # 款式匹配 (0.70~0.90), 需确认后开单
+    P2 = "P2"    # 品类+风格 (0.50~0.70), 仅供参考
 
 
 class DegradeState(str, Enum):
@@ -82,6 +96,26 @@ class UpdateVideoRequest(BaseModel):
     category_l1: str = Field(..., min_length=1)
     product_id: Optional[str] = Field(None, max_length=64)
     max_frames: int = Field(3, ge=1, le=10)
+
+
+class BatchSearchRequest(BaseModel):
+    """v1.4: 批量搜索 (≤7 张), SSE 流式返回"""
+    query_images: List[str] = Field(..., min_length=1, max_length=7, description="Base64 图片列表")
+    merchant_scope: Optional[List[str]] = Field(None, max_length=3000)
+    merchant_scope_id: Optional[str] = Field(None, max_length=64)
+    top_k: int = Field(100, ge=1, le=200)
+    data_scope: DataScope = DataScope.ALL
+    time_range: TimeRange = TimeRange.ALL
+
+
+class TagSearchRequest(BaseModel):
+    """v1.4: 标签搜索"""
+    tags: List[str] = Field(..., min_length=1, max_length=32, description="搜索标签列表")
+    merchant_scope: Optional[List[str]] = Field(None, max_length=3000)
+    merchant_scope_id: Optional[str] = Field(None, max_length=64)
+    top_k: int = Field(100, ge=1, le=200)
+    data_scope: DataScope = DataScope.ALL
+    time_range: TimeRange = TimeRange.ALL
 
 
 class BehaviorReportRequest(BaseModel):
@@ -132,6 +166,7 @@ class SearchResultItem(BaseModel):
     is_evergreen: bool = False
     category_l1: Optional[str] = None
     tags: Optional[List[str]] = None
+    match_level: Optional[MatchLevel] = None  # v1.4: P0/P1/P2
 
 
 class EffectiveParamsSnapshot(BaseModel):
@@ -157,6 +192,7 @@ class SearchMeta(BaseModel):
     search_scope_desc: str
     latency_ms: int
     zone_hit: str = "hot"  # "hot" | "hot+non_hot"
+    search_strategy: Optional[SearchStrategy] = None  # v1.4: brute_force/hnsw_filtered/hybrid
     effective_params: Optional[EffectiveParamsSnapshot] = None  # FIX-F
 
     # 性能分解

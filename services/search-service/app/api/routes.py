@@ -14,12 +14,14 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from app.core.config import get_settings
 from app.core.metrics import METRICS
 from app.model.schemas import (
+    BatchSearchRequest,
     BehaviorReportRequest,
     DegradeState,
     ErrorDetail,
     ErrorResponse,
     SearchRequest,
     SearchResponse,
+    TagSearchRequest,
 )
 
 logger = structlog.get_logger(__name__)
@@ -124,6 +126,145 @@ async def search_image(
                 "request_id": request_id,
                 "timestamp": int(time.time() * 1000),
             }
+        })
+
+
+# ── v1.4: 批量搜索 (SSE 流式返回) ──
+
+@router.post(
+    "/image/search/batch",
+    summary="批量图片检索 (SSE 流式)",
+    description="v1.4: 至多 7 张图批量搜索, 流式逐张返回结果",
+)
+async def search_image_batch(
+    req: BatchSearchRequest,
+    request: Request,
+    api_key: str = Depends(_verify_api_key),
+):
+    from starlette.responses import StreamingResponse
+    import json
+
+    lifecycle = request.app.state.lifecycle
+
+    async def event_stream():
+        tasks = []
+        for idx, query_image in enumerate(req.query_images):
+            single_req = SearchRequest(
+                query_image=query_image,
+                merchant_scope=req.merchant_scope,
+                merchant_scope_id=req.merchant_scope_id,
+                top_k=req.top_k,
+                data_scope=req.data_scope,
+                time_range=req.time_range,
+            )
+            request_id = f"{_gen_request_id()}_batch{idx}"
+            tasks.append((idx, lifecycle.pipeline.execute(single_req, request_id)))
+
+        # 并行执行, 先完成先推送
+        pending = {asyncio.create_task(coro): idx for idx, coro in tasks}
+        while pending:
+            done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                idx = pending.pop(task)
+                try:
+                    response = task.result()
+                    data = json.dumps({
+                        "index": idx,
+                        "results": [r.model_dump() for r in response.results],
+                        "meta": response.meta.model_dump(),
+                    }, ensure_ascii=False)
+                    yield f"data: {data}\n\n"
+                except Exception as e:
+                    error_data = json.dumps({
+                        "index": idx,
+                        "error": str(e),
+                    }, ensure_ascii=False)
+                    yield f"data: {error_data}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── v1.4: 标签搜索 ──
+
+@router.post(
+    "/tag/search",
+    summary="标签搜索",
+    description="v1.4: 多标签交集搜索, 按命中数排序",
+)
+async def search_by_tags(
+    req: TagSearchRequest,
+    request: Request,
+    api_key: str = Depends(_verify_api_key),
+):
+    request_id = _gen_request_id()
+    lifecycle = request.app.state.lifecycle
+
+    # 限流
+    if not lifecycle.rate_limiter.try_acquire("global_search"):
+        METRICS.rate_limited_total.labels(type="global").inc()
+        raise HTTPException(status_code=429, detail={
+            "error": {"code": "100_03_01", "message": "QPS limit exceeded"}
+        })
+
+    try:
+        # 解析商家范围
+        merchant_scope = req.merchant_scope
+        if req.merchant_scope_id and not merchant_scope:
+            merchant_scope = await lifecycle.scope_resolver.resolve(req.merchant_scope_id)
+
+        # 标签编码
+        from app.infra.vocab_cache import VocabCache
+        vocab: VocabCache = lifecycle.vocab_cache
+        tag_ids = [vocab.encode("tag", t) for t in req.tags if vocab.encode("tag", t) is not None]
+        if not tag_ids:
+            return {"results": [], "meta": {"request_id": request_id, "total_results": 0}}
+
+        # Milvus INVERTED 查询
+        candidates = await lifecycle.ann_searcher.search_by_tags_inverted(
+            tags=tag_ids,
+            top_k=req.top_k * 3,  # 放大候选, 后续按命中数排序
+            partition_filter="ts_month >= 0",
+        )
+
+        # 按标签命中数排序
+        for c in candidates:
+            c_tags = set(c.tags or [])
+            c._tag_hits = len(c_tags & set(tag_ids))
+        candidates.sort(key=lambda c: (-getattr(c, '_tag_hits', 0), -c.score))
+
+        # 商家过滤 (bitmap)
+        if merchant_scope:
+            candidates_filtered, _ = await lifecycle.bitmap_filter.filter_with_degrade(
+                candidate_pks=[c.image_pk for c in candidates],
+                merchant_scope=merchant_scope,
+                candidates=candidates,
+            )
+            candidates = candidates_filtered
+
+        # 构建响应
+        results = []
+        for i, c in enumerate(candidates[:req.top_k]):
+            results.append({
+                "image_id": c.image_pk,
+                "score": round(c.score, 4),
+                "product_id": c.product_id,
+                "tag_hits": getattr(c, '_tag_hits', 0),
+                "position": i + 1,
+            })
+
+        return {"results": results, "meta": {"request_id": request_id, "total_results": len(results)}}
+
+    except Exception as e:
+        import traceback
+        logger.error("tag_search_error", request_id=request_id, error=str(e), traceback=traceback.format_exc())
+        raise HTTPException(status_code=500, detail={
+            "error": {"code": "100_05_02", "message": "Tag search error", "request_id": request_id}
         })
 
 
