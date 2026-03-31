@@ -44,9 +44,9 @@ zones:
       M: 24                         # v4.0 从32调至24 (内存优化)
       efConstruction: 200
     search_params:
-      ef_search: 192                # v4.0 从128调至192 (Recall提升)
-      ef_search_s1: 128             # S1 降级
-      ef_search_s2: 64              # S2 降级
+      ef_search: 256                # v4.1 从192调至256 (召回率优先)
+      ef_search_s1: 192             # S1 降级 — 保持较高召回
+      ef_search_s2: 96              # S2 降级
     estimated_vectors: 750_000_000  # ~7.5亿
     sla: "99.99%"
     replicas: 3
@@ -73,42 +73,42 @@ zones:
 
 # ── 检索引擎 ──
 search:
-  # 双路径延迟模型 (v4.0)
+  # 双路径延迟模型 (v4.1 召回率优先)
   dual_path:
     fast_path:
-      p99_target_ms: 240            # v4.0 快路径 P99
-      traffic_ratio: 0.80           # ~80% 请求
+      p99_target_ms: 350            # v4.1 从240调至350 (容忍延迟换召回)
+      traffic_ratio: 0.65           # v4.1 更多请求走级联路径
     cascade_path:
-      p99_target_ms: 400            # v4.0 级联路径 P99
-      traffic_ratio: 0.20           # ~20% 请求
-      trigger_threshold: 0.80       # Top1 score < 0.80 触发级联
-      timeout_ms: 250               # 非热区查询超时
+      p99_target_ms: 550            # v4.1 从400调至550
+      traffic_ratio: 0.35           # v4.1 从20%提升至35%
+      trigger_threshold: 0.65       # v4.1 从0.80降至0.65 (更积极触发非热区搜索)
+      timeout_ms: 350               # v4.1 从250调至350
 
   # ANN 检索
   ann:
-    coarse_top_k: 2000              # ANN 粗排返回数
-    hot_timeout_ms: 150             # 热区查询超时
-    non_hot_timeout_ms: 250         # 非热区查询超时
+    coarse_top_k: 3000              # v4.1 从2000扩至3000 (召回率优先)
+    hot_timeout_ms: 200             # v4.1 从150调至200 (容忍更高延迟换召回)
+    non_hot_timeout_ms: 350         # v4.1 从250调至350
 
-  # Stage 1.5: 标签召回 (v4.0.1 Patch #4)
+  # Stage 1.5: 标签召回 (v4.1 召回率优先)
   tag_recall:
     enabled: true
-    idf_top_k: 5                    # IDF Top-5 标签截断
-    timeout_ms: 10                  # 硬超时熔断
-    inverted_top_k: 500
+    idf_top_k: 8                    # v4.1 从5调至8 (更多标签覆盖)
+    timeout_ms: 20                  # v4.1 从10调至20 (容忍更高延迟)
+    inverted_top_k: 1000            # v4.1 从500调至1000
 
-  # Refine 精排 (v4.0 扩池)
+  # Refine 精排 (v4.1 召回率优先)
   refine:
-    top_k: 2000                     # v4.0 从500扩至2000
-    top_k_s1: 1000                  # S1 降级
-    top_k_s2: 500                   # S2 降级
+    top_k: 3000                     # v4.1 从2000扩至3000 (匹配 coarse_top_k)
+    top_k_s1: 2000                  # v4.1 S1 保持较高精排池
+    top_k_s2: 800                   # v4.1 S2 从500调至800
     use_float32: true
 
-  # Fallback
+  # Fallback (v4.1 召回率优先: 更积极触发多路召回)
   fallback:
-    score_threshold: 0.80           # v4.0 与级联触发对齐
-    sub_image_top_k: 200
-    tag_top_k: 200
+    score_threshold: 0.70           # v4.1 从0.80降至0.70 (更积极触发)
+    sub_image_top_k: 500            # v4.1 从200扩至500
+    tag_top_k: 500                  # v4.1 从200扩至500
     enabled: true
 
   # 融合排序权重
@@ -192,14 +192,14 @@ bitmap_filter:
 # FIX #13: 所有阈值可通过配置服务 / Nacos 运行时修改, 无需重启
 degrade:
   s0_s1:
-    p99_threshold_ms: 450           # v4.0 从350ms调至450ms
-    duration_s: 120
-    error_rate_threshold: 0.0005
+    p99_threshold_ms: 600           # v4.1 从450调至600 (容忍更高延迟保召回)
+    duration_s: 180                 # v4.1 从120调至180 (更慎重进入降级)
+    error_rate_threshold: 0.001     # v4.1 从0.0005调至0.001
 
   s0_s2:
-    p99_threshold_ms: 800
-    duration_s: 30
-    error_rate_threshold: 0.01
+    p99_threshold_ms: 1000          # v4.1 从800调至1000
+    duration_s: 60                  # v4.1 从30调至60
+    error_rate_threshold: 0.02      # v4.1 从0.01调至0.02
 
   recovery:
     s1_dwell_s: 300

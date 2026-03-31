@@ -232,19 +232,22 @@ class DegradeStateMachine:
         if self._state == DegradeState.S0:
             return params
 
-        # S1/S2: 范围收缩到 热区 + 常青, 禁用非热区级联
-        if self._state in (DegradeState.S1, DegradeState.S2):
-            params.time_range = TimeRange.HOT_PLUS_EVERGREEN
-            params.enable_fallback = False
-            params.enable_cascade = False  # 禁用非热区 DiskANN
-
+        # v1.5 召回率优先:
+        # S1 预降级 — 保留 fallback 多路召回, 仅禁用非热区级联
+        # S2 强降级 — 全面收缩 (禁用 fallback + 级联)
         if self._state == DegradeState.S1:
-            params.ef_search = settings.hot_zone.ef_search_s1  # 128
-            params.refine_top_k = settings.search.refine.top_k_s1  # 1000
+            params.time_range = TimeRange.HOT_PLUS_EVERGREEN
+            params.enable_cascade = False  # 禁用非热区 DiskANN (节省延迟)
+            params.enable_fallback = True  # v1.5: S1 保留 fallback 保证召回率
+            params.ef_search = settings.hot_zone.ef_search_s1  # 192 (v1.5 从128提升)
+            params.refine_top_k = settings.search.refine.top_k_s1  # 2000 (v1.5 从1000提升)
 
         elif self._state == DegradeState.S2:
-            params.ef_search = settings.hot_zone.ef_search_s2  # 64
-            params.refine_top_k = settings.search.refine.top_k_s2  # 500
+            params.time_range = TimeRange.HOT_PLUS_EVERGREEN
+            params.enable_fallback = False
+            params.enable_cascade = False
+            params.ef_search = settings.hot_zone.ef_search_s2  # 96 (v1.5 从64提升)
+            params.refine_top_k = settings.search.refine.top_k_s2  # 800 (v1.5 从500提升)
 
         elif self._state == DegradeState.S3:
             # 灰度放量

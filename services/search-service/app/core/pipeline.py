@@ -1,19 +1,23 @@
 """
-级联检索流水线 — v1.4 生产加固
-Stage 0   : 降级覆盖 + merchant_scope 解析
+级联检索流水线 — v1.5 召回率优先 + 调用前缩小范围
+Stage 0   : 降级覆盖 + merchant_scope 解析 + bitmap 预构建 (与 Stage 1 并行)
 Stage 1   : 特征提取 (TensorRT FP16, GPU→CPU fallback)
-Stage 1.5 : 全量标签召回 (INVERTED, IDF Top-5, 10ms 熔断)
-Stage 2-H : 热区 HNSW ANN (M=24, ef=192)
+Stage 1.5+2-H : 标签召回 + 热区 HNSW ANN **并行执行**
 Stage 2-NH: [级联] 非热区 DiskANN (MD=64, SL=200)
-Stage 3   : 商家过滤 (Roaring Bitmap, 外部 gRPC)
-Stage 4   : Refine 精排 (float32, 2000 候选)
+Stage 3   : 商家过滤 (Roaring Bitmap, 使用预构建 bitmap)
+Stage 4   : Refine 精排 (float32, 3000 候选)
 Stage 5-7 : [条件] Fallback 子图+标签多路召回
 Stage 8   : 响应构建 + 异步日志
 
-v1.4 加固:
+v1.5 优化原则:
+  - 召回率和准确性优先, 执行时间次之
+  - 能在调用前缩小范围就先缩小范围:
+    · bitmap 预构建与特征提取并行 (省去串行等待)
+    · 标签召回与热区 ANN 并行 (两者独立, 无需串行)
+    · 商家范围自适应 coarse_top_k (有过滤时放大候选池)
+    · 类目预过滤: 特征提取的 category 预测写入 Milvus expr (缩小搜索空间)
   - P0-A: Milvus 熔断器异常 → 返回空结果 (降级安全)
   - P0-C: bitmap 全不可用 (filter_skipped=True) → 联动 FSM 强制 S2
-  - P0-C: 连续 N 次 filter_skipped → 自动触发 force_state
 """
 from __future__ import annotations
 
@@ -132,6 +136,9 @@ class SearchPipeline:
         # P0-C: bitmap 连续跳过计数器
         self._bitmap_skip_consecutive = 0
 
+    # ── 自适应 coarse_top_k: 有商家过滤时放大候选池, 补偿后续过滤损耗 ──
+    MERCHANT_SCOPE_TOP_K_MULTIPLIER = 1.5
+
     async def execute(self, req: SearchRequest, request_id: str) -> SearchResponse:
         ctx = PipelineContext(request_id=request_id)
 
@@ -144,23 +151,51 @@ class SearchPipeline:
         if req.merchant_scope_id and not params.merchant_scope:
             params.merchant_scope = await self._scope.resolve(req.merchant_scope_id)
 
-        # ── Stage 1: 特征提取 (GPU → CPU fallback) ──
+        # ── v1.5: 特征提取 + bitmap 预构建 **并行** ──
+        # 原则: 能在调用前缩小范围就先缩小范围
+        # bitmap 构建需要 PG/Redis 查询, 与 GPU 推理无依赖, 可并行
+        bitmap_prebuild_task = None
+        if params.merchant_scope and hasattr(self._bitmap, '_bitmap_builder'):
+            bitmap_prebuild_task = asyncio.create_task(
+                self._bitmap._bitmap_builder.build(params.merchant_scope)
+            )
+
         t = ctx.timer_start("feature")
         features = await self._extract_features(req.query_image)
         ctx.timer_end("feature", t)
 
-        # ── Stage 1.5: 全量标签召回 (v4.0 新增) ──
-        tag_recall_candidates: List[Candidate] = []
-        if settings.feature_flags.enable_tag_recall_stage and features.tags_pred:
-            t = ctx.timer_start("tag_recall")
-            tag_recall_candidates = await self._tag_recall(features, params)
-            ctx.timer_end("tag_recall", t)
+        # ── v1.5: 自适应 coarse_top_k ──
+        # 有商家过滤时, 放大候选池以补偿后续过滤损耗, 保证最终召回量
+        coarse_top_k = settings.search.ann.coarse_top_k
+        if params.merchant_scope:
+            coarse_top_k = int(coarse_top_k * self.MERCHANT_SCOPE_TOP_K_MULTIPLIER)
 
-        # ── Stage 2-H: 热区 HNSW ANN 检索 ──
-        # P0-A: CircuitBreakerOpenError → 返回空列表 (安全降级)
+        # ── v1.5: 类目预过滤 — 特征提取的 category 预测写入 Milvus expr ──
+        category_filter = self._build_category_prefilter(features)
+
+        # ── v1.5: 标签召回 + 热区 ANN **并行执行** ──
+        # 两者都依赖 features, 但互相独立, 并行可节省 10-20ms
+        tag_recall_task = None
+        if settings.feature_flags.enable_tag_recall_stage and features.tags_pred:
+            tag_recall_task = asyncio.create_task(
+                self._tag_recall(features, params)
+            )
+
         t = ctx.timer_start("ann_hot")
-        hot_candidates = await self._search_hot_zone(features, params)
+        hot_candidates = await self._search_hot_zone(
+            features, params, coarse_top_k, category_filter
+        )
         ctx.timer_end("ann_hot", t)
+
+        # 收集并行标签召回结果
+        tag_recall_candidates: List[Candidate] = []
+        if tag_recall_task is not None:
+            t_tag = ctx.timer_start("tag_recall")
+            try:
+                tag_recall_candidates = await tag_recall_task
+            except Exception as e:
+                logger.warning("tag_recall_parallel_error", error=str(e))
+            ctx.timer_end("tag_recall", t_tag)
 
         # ── 级联判定: Top1 score < cascade_trigger ──
         top1_score = hot_candidates[0].score if hot_candidates else 0.0
@@ -176,7 +211,9 @@ class SearchPipeline:
         ):
             # ── Stage 2-NH: 非热区 DiskANN 检索 (级联路径) ──
             t = ctx.timer_start("ann_non_hot")
-            non_hot_candidates = await self._search_non_hot_zone(features, params)
+            non_hot_candidates = await self._search_non_hot_zone(
+                features, params, coarse_top_k
+            )
             ctx.timer_end("ann_non_hot", t)
             ctx.strategy = Strategy.CASCADE_PATH
             ctx.zone_hit = "hot+non_hot"
@@ -188,8 +225,15 @@ class SearchPipeline:
             hot_candidates, non_hot_candidates, tag_recall_candidates
         )
 
-        # ── Stage 3: 商家过滤 ──
+        # ── Stage 3: 商家过滤 (使用预构建的 bitmap) ──
         if params.merchant_scope:
+            # 等待预构建完成 (通常此时已完成, 因为特征提取+ANN 耗时更长)
+            if bitmap_prebuild_task is not None:
+                try:
+                    await bitmap_prebuild_task
+                except Exception:
+                    pass  # bitmap 构建失败由 filter_with_degrade 内部降级处理
+
             t = ctx.timer_start("filter")
             all_candidates, filter_skipped = await self._bitmap.filter_with_degrade(
                 candidate_pks=[c.image_pk for c in all_candidates],
@@ -230,7 +274,7 @@ class SearchPipeline:
             ctx.timer_end("refine", t)
 
         # ── Stage 5-7: 条件 Fallback (子图+标签多路召回) ──
-        # v4.0: 基于 top1_score / confidence 触发, 不依赖 top_k
+        # v4.1: 基于 top1_score 触发, 阈值降至 0.70 更积极召回
         top1_after_refine = all_candidates[0].score if all_candidates else 0.0
         if (
             params.enable_fallback
@@ -257,10 +301,10 @@ class SearchPipeline:
                     self._ann.search_hot(
                         vector=features.global_vec,
                         partition_filter="is_evergreen == true",
-                        ef_search=64,
+                        ef_search=96,
                         top_k=min(params.top_k, 50),
                     ),
-                    timeout=0.2,
+                    timeout=0.3,
                 )
             except Exception:
                 pass  # 终极兜底失败仍返回空结果
@@ -330,20 +374,32 @@ class SearchPipeline:
             return []
 
     async def _search_hot_zone(
-        self, features: FeatureResult, params: EffectiveParams
+        self,
+        features: FeatureResult,
+        params: EffectiveParams,
+        coarse_top_k: int = 0,
+        category_filter: str = "",
     ) -> List[Candidate]:
-        """热区 HNSW 检索 — M=24, ef=192, P99 ≤150ms
+        """热区 HNSW 检索 — M=24, ef=256, P99 ≤200ms
+        v1.5: 支持自适应 coarse_top_k + 类目预过滤
         P0-A: 熔断器打开 → 返回空列表 (安全降级)
         """
         from app.core.circuit_breaker import CircuitBreakerOpenError
+        effective_top_k = coarse_top_k or settings.search.ann.coarse_top_k
         timeout_s = settings.search.ann.hot_timeout_ms / 1000
+
+        # v1.5: 类目预过滤 — 缩小搜索空间
+        partition_filter = self._build_hot_partition_filter(params)
+        if category_filter:
+            partition_filter = f"({partition_filter}) and ({category_filter})"
+
         try:
             return await asyncio.wait_for(
                 self._ann.search_hot(
                     vector=features.global_vec,
-                    partition_filter=self._build_hot_partition_filter(params),
+                    partition_filter=partition_filter,
                     ef_search=params.ef_search,
-                    top_k=settings.search.ann.coarse_top_k,
+                    top_k=effective_top_k,
                 ),
                 timeout=timeout_s,
             )
@@ -359,12 +415,17 @@ class SearchPipeline:
             return []
 
     async def _search_non_hot_zone(
-        self, features: FeatureResult, params: EffectiveParams
+        self,
+        features: FeatureResult,
+        params: EffectiveParams,
+        coarse_top_k: int = 0,
     ) -> List[Candidate]:
-        """非热区 DiskANN 检索 — MD=64, SL=200, P99 ≤250ms
+        """非热区 DiskANN 检索 — MD=64, SL=200, P99 ≤350ms
+        v1.5: 支持自适应 coarse_top_k
         P0-A: 熔断器打开 → 返回空列表
         """
         from app.core.circuit_breaker import CircuitBreakerOpenError
+        effective_top_k = coarse_top_k or settings.search.ann.coarse_top_k
         timeout_s = settings.search.dual_path.cascade_timeout_ms / 1000
         try:
             return await asyncio.wait_for(
@@ -372,7 +433,7 @@ class SearchPipeline:
                     vector=features.global_vec,
                     partition_filter=self._build_non_hot_partition_filter(params),
                     search_list_size=settings.non_hot_zone.search_list_size,
-                    top_k=settings.search.ann.coarse_top_k,
+                    top_k=effective_top_k,
                 ),
                 timeout=timeout_s,
             )
@@ -437,6 +498,23 @@ class SearchPipeline:
         result = list(seen.values())
         result.sort(key=lambda x: x.score, reverse=True)
         return result
+
+    # ── 类目预过滤 (v1.5 新增) ──
+
+    @staticmethod
+    def _build_category_prefilter(features: FeatureResult) -> str:
+        """v1.5: 用特征提取的类目预测缩小 Milvus 搜索空间
+
+        仅当模型对类目预测置信度较高时才启用, 避免误过滤导致召回损失。
+        使用 category_l1 (一级类目) 做粗过滤, 保留足够宽的搜索范围。
+        """
+        cat_pred = getattr(features, "category_l1_pred", None)
+        cat_conf = getattr(features, "category_l1_conf", 0.0)
+
+        # 仅高置信度 (>=0.85) 时启用类目预过滤, 保守策略保召回
+        if cat_pred is not None and cat_conf >= 0.85:
+            return f"category_l1 == {cat_pred}"
+        return ""
 
     # ── 分区过滤表达式构建 ──
 
