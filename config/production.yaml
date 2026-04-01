@@ -30,7 +30,7 @@ config_service:
     api_keys_hashes: ""              # SHA256 hash CSV, FIX #6
 
 system:
-  version: "1.3.0"
+  version: "0.3.0.0"
   env: production
   cluster_id: "imgsrch-prod-01"
 
