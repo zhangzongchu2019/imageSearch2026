@@ -1,5 +1,10 @@
 """
-inference-service — CLIP ViT-B/32 特征提取微服务 (GPU FP16)
+inference-service — CLIP ViT-B/32 特征提取 + 零样本分类微服务 (GPU FP16)
+
+v1.4: 新增零样本品类识别和标签提取 (CLIP zero-shot classification)
+  - 图片向量与预定义文本向量做余弦相似度
+  - 品类: 取最高分类目 + 置信度
+  - 标签: 取 top-K 高分标签
 
 供 write-service（导入时）和 search-service（查询时）共同调用。
 输出 256 维 L2 归一化向量（FP32），匹配 Milvus schema。
@@ -13,6 +18,7 @@ import logging
 import os
 import threading
 from contextlib import asynccontextmanager
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -27,16 +33,78 @@ EMBEDDING_DIM = 256
 # Global state filled at startup
 _model = None
 _preprocess = None
+_tokenizer = None
 _projection: torch.Tensor | None = None  # 512 → 256 投影矩阵 (GPU)
 _device: torch.device = torch.device("cpu")
 _lock = threading.Lock()  # GPU 序列化锁
 
+# 零样本分类 — 预计算文本向量
+_category_text_features: torch.Tensor | None = None  # (N_cat, 512)
+_tag_text_features: torch.Tensor | None = None        # (N_tag, 512)
+_category_names: List[str] = []
+_tag_names: List[str] = []
+
 MODEL_PATH = "/models/ViT-B-32.pt"
+
+# ── 品类和标签词表 ──
+
+CATEGORIES = {
+    "服装": ["a photo of clothing", "a photo of garment", "a photo of dress shirt jacket coat pants skirt"],
+    "鞋帽": ["a photo of shoes", "a photo of boots sneakers heels hat cap"],
+    "箱包": ["a photo of bag", "a photo of handbag backpack wallet luggage purse"],
+    "珠宝玉器": ["a photo of jewelry", "a photo of jade gold diamond gem ring bracelet"],
+    "首饰配饰": ["a photo of accessories", "a photo of necklace earring brooch hairpin"],
+}
+
+TAGS = {
+    # 服装
+    "上衣": "a photo of a top shirt blouse",
+    "裤子": "a photo of pants trousers",
+    "裙子": "a photo of a skirt dress",
+    "外套": "a photo of a jacket coat outerwear",
+    "T恤": "a photo of a t-shirt tee",
+    # 鞋
+    "运动鞋": "a photo of sneakers running shoes",
+    "高跟鞋": "a photo of high heels pumps",
+    "皮鞋": "a photo of leather shoes",
+    "靴子": "a photo of boots",
+    # 包
+    "手提包": "a photo of a handbag tote bag",
+    "双肩包": "a photo of a backpack",
+    "钱包": "a photo of a wallet",
+    "旅行箱": "a photo of luggage suitcase",
+    # 珠宝
+    "翡翠": "a photo of jade jadeite",
+    "黄金": "a photo of gold jewelry",
+    "钻石": "a photo of diamond",
+    "手镯": "a photo of a bracelet bangle",
+    "戒指": "a photo of a ring",
+    "项链": "a photo of a necklace",
+    "耳环": "a photo of earrings",
+    # 材质/风格
+    "真皮": "a photo of genuine leather product",
+    "PU皮": "a photo of PU leather synthetic product",
+    "棉质": "a photo of cotton fabric product",
+    "复古风": "a photo of vintage retro style product",
+    "简约风": "a photo of minimalist simple style product",
+    # 颜色
+    "红色": "a photo of a red product",
+    "蓝色": "a photo of a blue product",
+    "黑色": "a photo of a black product",
+    "白色": "a photo of a white product",
+    "棕色": "a photo of a brown product",
+    # 季节
+    "春季": "a photo of spring season fashion",
+    "夏季": "a photo of summer season fashion",
+    "秋季": "a photo of autumn fall season fashion",
+    "冬季": "a photo of winter season fashion",
+}
 
 
 def _load_model():
-    """加载 CLIP ViT-B/32 并初始化投影矩阵"""
-    global _model, _preprocess, _projection, _device
+    """加载 CLIP ViT-B/32 并初始化投影矩阵 + 零样本分类文本向量"""
+    global _model, _preprocess, _tokenizer, _projection, _device
+    global _category_text_features, _tag_text_features, _category_names, _tag_names
     import open_clip
 
     # 选择设备
@@ -64,6 +132,8 @@ def _load_model():
         )
     torch.load = _orig_torch_load
 
+    _tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
     model.eval()
     model = model.to(_device)
 
@@ -83,10 +153,86 @@ def _load_model():
     if _device.type == "cuda":
         _projection = _projection.half()
 
+    # ── 预计算零样本分类文本向量 ──
+    logger.info("Computing zero-shot text features...")
+
+    # 品类文本向量
+    _category_names = list(CATEGORIES.keys())
+    cat_texts = []
+    for cat_name in _category_names:
+        # 每个品类多个描述取平均
+        cat_texts.extend(CATEGORIES[cat_name])
+
+    cat_tokens = _tokenizer(cat_texts).to(_device)
+    with torch.no_grad():
+        cat_feats = _model.encode_text(cat_tokens)  # (N, 512)
+    cat_feats = cat_feats / cat_feats.norm(dim=-1, keepdim=True)
+
+    # 每个品类多个描述取平均
+    idx = 0
+    cat_avg = []
+    for cat_name in _category_names:
+        n = len(CATEGORIES[cat_name])
+        avg = cat_feats[idx:idx + n].mean(dim=0)
+        avg = avg / avg.norm()
+        cat_avg.append(avg)
+        idx += n
+    _category_text_features = torch.stack(cat_avg)  # (5, 512)
+
+    # 标签文本向量
+    _tag_names = list(TAGS.keys())
+    tag_texts = [TAGS[t] for t in _tag_names]
+    tag_tokens = _tokenizer(tag_texts).to(_device)
+    with torch.no_grad():
+        tag_feats = _model.encode_text(tag_tokens)  # (N, 512)
+    _tag_text_features = tag_feats / tag_feats.norm(dim=-1, keepdim=True)
+
     logger.info(
-        "CLIP ViT-B/32 loaded on %s, projection matrix initialized (512 → %d)",
-        _device, EMBEDDING_DIM,
+        "CLIP ViT-B/32 loaded on %s, %d categories, %d tags ready",
+        _device, len(_category_names), len(_tag_names),
     )
+
+
+def _do_inference(image_bytes: bytes) -> dict:
+    """GPU FP16 推理 — 向量提取 + 零样本品类/标签分类"""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_tensor = _preprocess(img).unsqueeze(0).to(_device)  # (1, 3, 224, 224)
+
+    if _device.type == "cuda":
+        img_tensor = img_tensor.half()
+
+    with _lock:
+        with torch.no_grad():
+            image_features = _model.encode_image(img_tensor)  # (1, 512)
+
+    # ── 1. 投影 + L2 归一化 → 256d 向量 ──
+    vec_256 = (image_features[0] @ _projection).float()
+    norm = torch.linalg.norm(vec_256)
+    if norm > 0:
+        vec_256 = vec_256 / norm
+    global_vec = vec_256.cpu().numpy().tolist()
+
+    # ── 2. 零样本品类分类 ──
+    img_feat_norm = image_features / image_features.norm(dim=-1, keepdim=True)  # (1, 512)
+    cat_sims = (img_feat_norm @ _category_text_features.T).squeeze(0).float()  # (N_cat,)
+    cat_idx = cat_sims.argmax().item()
+    cat_conf = cat_sims[cat_idx].item()
+    category_l1 = _category_names[cat_idx]
+
+    # ── 3. 零样本标签提取 (top-8) ──
+    tag_sims = (img_feat_norm @ _tag_text_features.T).squeeze(0).float()  # (N_tag,)
+    top_k = min(8, len(_tag_names))
+    top_indices = tag_sims.topk(top_k).indices.tolist()
+    top_scores = tag_sims.topk(top_k).values.tolist()
+    # 只保留相似度 > 0.2 的标签
+    tags = [_tag_names[i] for i, s in zip(top_indices, top_scores) if s > 0.2]
+
+    return {
+        "global_vec": global_vec,
+        "category_l1": category_l1,
+        "category_l1_conf": round(cat_conf, 4),
+        "tags": tags,
+    }
 
 
 @asynccontextmanager
@@ -104,29 +250,11 @@ class ExtractRequest(BaseModel):
 
 class ExtractResponse(BaseModel):
     global_vec: list[float]
-    tags_pred: list[int]
-    category_l1_pred: int
-
-
-def _do_inference(image_bytes: bytes) -> list[float]:
-    """GPU FP16 推理 — 通过锁序列化 GPU 访问"""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img_tensor = _preprocess(img).unsqueeze(0).to(_device)  # (1, 3, 224, 224)
-
-    if _device.type == "cuda":
-        img_tensor = img_tensor.half()
-
-    with _lock:
-        with torch.no_grad():
-            features = _model.encode_image(img_tensor)  # (1, 512)
-
-    # 投影 + L2 归一化，全程 GPU 计算
-    vec_256 = (features[0] @ _projection).float()  # → FP32
-    norm = torch.linalg.norm(vec_256)
-    if norm > 0:
-        vec_256 = vec_256 / norm
-
-    return vec_256.cpu().numpy().tolist()
+    category_l1: str
+    category_l1_conf: float
+    tags: list[str]
+    tags_pred: list[int]       # 兼容旧接口
+    category_l1_pred: int      # 兼容旧接口
 
 
 @app.post("/api/v1/extract", response_model=ExtractResponse)
@@ -137,12 +265,19 @@ async def extract(req: ExtractRequest):
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
     loop = asyncio.get_running_loop()
-    global_vec = await loop.run_in_executor(None, _do_inference, image_bytes)
+    result = await loop.run_in_executor(None, _do_inference, image_bytes)
+
+    # 标签编码 (简单 hash)
+    tag_ids = [hash(t) % 4096 for t in result["tags"]]
+    cat_id = _category_names.index(result["category_l1"]) if result["category_l1"] in _category_names else 0
 
     return ExtractResponse(
-        global_vec=global_vec,
-        tags_pred=[],
-        category_l1_pred=0,
+        global_vec=result["global_vec"],
+        category_l1=result["category_l1"],
+        category_l1_conf=result["category_l1_conf"],
+        tags=result["tags"],
+        tags_pred=tag_ids,
+        category_l1_pred=cat_id,
     )
 
 
@@ -150,7 +285,7 @@ async def extract(req: ExtractRequest):
 async def healthz():
     if _model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    return {"status": "ok", "device": str(_device)}
+    return {"status": "ok", "device": str(_device), "categories": len(_category_names), "tags": len(_tag_names)}
 
 
 if __name__ == "__main__":
