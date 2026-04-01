@@ -63,6 +63,89 @@ MILVUS_BATCH_SIZE = 5000
 MERCHANT_ID_START = 10001
 MERCHANT_ID_END = 12999
 CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "/tmp/batch_import_checkpoint.json")
+TASK_LOG_DIR = os.getenv("TASK_LOG_DIR", "data/task_logs")
+
+
+# ── Task Tracker — 记录每次运行的详细信息 ──────────────────────────────────
+
+class TaskTracker:
+    """记录批量导入任务的详细执行信息，输出到 data/task_logs/。
+
+    每次运行生成一个 JSON 日志文件:
+      data/task_logs/batch_import_YYYYMMDD_HHMMSS.json
+
+    包含: 运行参数、各阶段耗时/统计、失败记录、最终汇总。
+    """
+
+    def __init__(self, args: argparse.Namespace):
+        os.makedirs(TASK_LOG_DIR, exist_ok=True)
+        self.run_id = time.strftime("%Y%m%d_%H%M%S")
+        self.log_file = os.path.join(TASK_LOG_DIR, f"batch_import_{self.run_id}.json")
+        self.data = {
+            "run_id": self.run_id,
+            "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": None,
+            "args": {k: v for k, v in vars(args).items()},
+            "stages": {},
+            "download_failures": [],
+            "summary": {},
+        }
+        self._stage_t0: dict[str, float] = {}
+
+    def stage_start(self, name: str, detail: dict | None = None):
+        """标记阶段开始"""
+        self._stage_t0[name] = time.time()
+        self.data["stages"][name] = {
+            "status": "running",
+            "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "detail": detail or {},
+        }
+
+    def stage_end(self, name: str, detail: dict | None = None):
+        """标记阶段结束，记录耗时"""
+        elapsed = time.time() - self._stage_t0.get(name, time.time())
+        stage = self.data["stages"].get(name, {})
+        stage["status"] = "done"
+        stage["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        stage["elapsed_sec"] = round(elapsed, 1)
+        if detail:
+            stage["detail"].update(detail)
+        self.data["stages"][name] = stage
+
+    def record_download_failure(self, url: str, image_pk: str, error: str):
+        """记录单条下载失败"""
+        self.data["download_failures"].append({
+            "url": url,
+            "image_pk": image_pk,
+            "error": error,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    def set_summary(self, summary: dict):
+        """设置最终汇总"""
+        self.data["summary"] = summary
+        self.data["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def save(self):
+        """写入 JSON 日志文件"""
+        with open(self.log_file, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        n_fail = len(self.data["download_failures"])
+        log.info(f"Task log saved: {self.log_file} "
+                 f"(download failures: {n_fail})")
+
+    def save_failures_csv(self):
+        """单独输出失败 URL 列表 (方便重试)"""
+        failures = self.data["download_failures"]
+        if not failures:
+            return
+        csv_path = os.path.join(TASK_LOG_DIR, f"download_failures_{self.run_id}.csv")
+        with open(csv_path, "w") as f:
+            f.write("url,image_pk,error\n")
+            for r in failures:
+                err = r["error"].replace('"', "'")
+                f.write(f'"{r["url"]}","{r["image_pk"]}","{err}"\n')
+        log.info(f"Failure URLs saved: {csv_path} ({len(failures)} records)")
 
 
 # ── Projection Matrix (matches inference-service exactly) ─────────────────
@@ -270,6 +353,7 @@ async def download_images(
     image_metas: list[dict],
     download_dir: str = "/tmp/clothing_images",
     proxies_str: Optional[str] = None,
+    tracker: Optional["TaskTracker"] = None,
 ) -> list[dict]:
     """Download images concurrently via multiple proxy channels + direct."""
     import httpx
@@ -335,8 +419,13 @@ async def download_images(
                     success += 1
                 else:
                     failed += 1
-            except Exception:
+                    err = f"status={resp.status_code}, content-type={ct}, size={len(resp.content)}"
+                    if tracker:
+                        tracker.record_download_failure(meta["uri"], meta["image_pk"], err)
+            except Exception as e:
                 failed += 1
+                if tracker:
+                    tracker.record_download_failure(meta["uri"], meta["image_pk"], str(e)[:200])
             # Small delay to avoid bursting
             await asyncio.sleep(0.05)
 
@@ -852,6 +941,10 @@ def save_backup(image_metas: list[dict], backup_dir: str):
 # ── 9. Main ──────────────────────────────────────────────────────────────────
 
 async def async_main(args):
+    # ── Task Tracker ────────────────────────────────────────────────────
+    tracker = TaskTracker(args)
+    task_t0 = time.time()
+
     # ── Resume logic ────────────────────────────────────────────────────
     checkpoint = load_checkpoint() if args.resume else None
     resume_stage = checkpoint.get("stage") if checkpoint else None
@@ -905,32 +998,49 @@ async def async_main(args):
         log.info(f"Found {len(image_metas)} local images")
         emit_progress("download", len(image_metas), len(image_metas),
                        f"Using {len(image_metas)} already-downloaded images")
+        tracker.stage_start("collect", {"source": "resume_local"})
+        tracker.stage_end("collect", {"count": len(image_metas)})
+        tracker.stage_start("download", {"source": "resume_local"})
+        tracker.stage_end("download", {"success": len(image_metas), "failed": 0})
     elif checkpoint and not url_file_available and download_dir_has_images:
         log.info(f"URL file missing ({args.url_file}), using {args.download_dir}")
         image_metas = collect_image_urls_from_local(args.download_dir, args.count)
         log.info(f"Found {len(image_metas)} local images")
         emit_progress("download", len(image_metas), len(image_metas),
                        f"Using {len(image_metas)} already-downloaded images")
+        tracker.stage_start("collect", {"source": "local_fallback"})
+        tracker.stage_end("collect", {"count": len(image_metas)})
+        tracker.stage_start("download", {"source": "local_fallback"})
+        tracker.stage_end("download", {"success": len(image_metas), "failed": 0})
     else:
+        tracker.stage_start("collect", {"url_file": args.url_file, "local_dir": args.local_dir})
         emit_progress("collect", 0, args.count, "Collecting image URLs...")
         image_metas = await collect_image_urls(args.count, args.local_dir, args.url_file)
         log.info(f"Collected {len(image_metas)} image URLs/paths")
         emit_progress("collect", len(image_metas), len(image_metas), f"Collected {len(image_metas)} URLs")
+        tracker.stage_end("collect", {"count": len(image_metas)})
 
         if not image_metas:
             log.error("No images collected, aborting")
             emit_progress("error", 0, 0, "No images collected, aborting")
+            tracker.set_summary({"status": "error", "reason": "no images collected"})
+            tracker.save()
             return
 
         _save_ckpt("collect", len(image_metas))
 
+        total_to_download = len(image_metas)
+        tracker.stage_start("download", {"total": total_to_download, "proxies": args.proxies})
         emit_progress("download", 0, len(image_metas), "Downloading images...")
         image_metas = await download_images(
-            image_metas, args.download_dir, proxies_str=args.proxies,
+            image_metas, args.download_dir, proxies_str=args.proxies, tracker=tracker,
         )
         image_metas = [m for m in image_metas if m.get("local_path")]
+        n_failed = total_to_download - len(image_metas)
         log.info(f"Have {len(image_metas)} images ready for processing")
         emit_progress("download", len(image_metas), len(image_metas), f"Downloaded {len(image_metas)} images")
+        tracker.stage_end("download", {"success": len(image_metas), "failed": n_failed})
+        tracker.save_failures_csv()
 
     if not image_metas:
         log.error("No images downloaded, aborting")
@@ -940,6 +1050,8 @@ async def async_main(args):
     _save_ckpt("download", len(image_metas))
 
     # Step 3: Extract features + zero-shot classification
+    tracker.stage_start("extract", {"device": "cuda" if torch.cuda.is_available() else "cpu",
+                                     "model_path": args.model_path, "input_count": len(image_metas)})
     emit_progress("extract", 0, len(image_metas), "Loading CLIP model...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -950,10 +1062,20 @@ async def async_main(args):
     if not image_metas:
         log.error("Feature extraction produced no results, aborting")
         emit_progress("error", 0, 0, "Feature extraction produced no results")
+        tracker.stage_end("extract", {"output_count": 0})
+        tracker.set_summary({"status": "error", "reason": "feature extraction failed"})
+        tracker.save()
         return
     log.info(f"Features extracted + classified for {len(image_metas)} images")
     emit_progress("extract", len(image_metas), len(image_metas),
                   f"Extracted + classified {len(image_metas)} images")
+
+    # 统计品类分布
+    cat_dist: dict[str, int] = {}
+    for m in image_metas:
+        cat_name = m.get("category_l1_name", str(m.get("category_l1", "unknown")))
+        cat_dist[cat_name] = cat_dist.get(cat_name, 0) + 1
+    tracker.stage_end("extract", {"output_count": len(image_metas), "category_distribution": cat_dist})
 
     # Step 4: Enrich metadata (product_id, merchant_id — categories already filled)
     enrich_metadata(image_metas)
@@ -962,33 +1084,58 @@ async def async_main(args):
     # Step 5: Write to Milvus
     if past_stage("milvus"):
         log.info("Skipping Milvus insert (already done in previous run)")
+        tracker.stage_start("milvus", {"skipped": True})
+        tracker.stage_end("milvus", {"skipped": True})
     else:
+        tracker.stage_start("milvus", {"host": MILVUS_HOST, "collection": COLLECTION_NAME,
+                                        "count": len(image_metas)})
         emit_progress("milvus", 0, len(image_metas), "Inserting into Milvus...")
         insert_milvus(image_metas)
         emit_progress("milvus", len(image_metas), len(image_metas), "Milvus insert complete")
         _save_ckpt("milvus", len(image_metas))
+        tracker.stage_end("milvus", {"upserted": len(image_metas)})
 
     # Step 6: Write to PostgreSQL (with URI)
     if past_stage("pg"):
         log.info("Skipping PG insert (already done in previous run)")
+        tracker.stage_start("pg", {"skipped": True})
+        tracker.stage_end("pg", {"skipped": True})
     else:
+        tracker.stage_start("pg", {"dsn_host": "localhost:5432", "count": len(image_metas)})
         emit_progress("pg", 0, len(image_metas), "Inserting into PostgreSQL...")
         insert_pg_dedup(image_metas)
         emit_progress("pg", len(image_metas), len(image_metas), "PostgreSQL insert complete")
         _save_ckpt("pg", len(image_metas))
+        tracker.stage_end("pg", {"inserted": len(image_metas)})
 
     # Step 7: Kafka events (optional)
     if not args.skip_kafka:
+        tracker.stage_start("kafka", {"broker": KAFKA_BROKER})
         emit_kafka_events(image_metas)
+        tracker.stage_end("kafka", {"emitted": len(image_metas)})
     else:
         log.info("Skipping Kafka events (--skip-kafka)")
 
     # Step 8: Local backup (optional)
     if args.backup_dir:
+        tracker.stage_start("backup", {"dir": args.backup_dir})
         save_backup(image_metas, args.backup_dir)
+        tracker.stage_end("backup", {"count": len(image_metas)})
 
     clear_checkpoint()
-    log.info(f"=== Import complete: {len(image_metas)} images ===")
+
+    # ── 最终汇总 ──
+    total_elapsed = time.time() - task_t0
+    tracker.set_summary({
+        "status": "success",
+        "total_images": len(image_metas),
+        "total_elapsed_sec": round(total_elapsed, 1),
+        "download_failures": len(tracker.data["download_failures"]),
+        "category_distribution": cat_dist,
+    })
+    tracker.save()
+
+    log.info(f"=== Import complete: {len(image_metas)} images in {total_elapsed:.0f}s ===")
     emit_progress("done", len(image_metas), len(image_metas), f"Import complete: {len(image_metas)} images")
 
 
