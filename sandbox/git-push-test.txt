@@ -1,8 +1,0 @@
-Git Push Test
-=============
-This file is used to verify that git push to GitHub works correctly.
-
-Created: 2026-03-31
-Purpose: Test git remote connectivity and push permissions.
-
-If you can see this file on GitHub, the push was successful.

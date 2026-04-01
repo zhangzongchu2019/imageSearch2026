@@ -1,0 +1,128 @@
+# ============================================================
+# 补充基础设施 (复用宿主机已有的 PG/Redis/MinIO)
+# 只启动: Kafka + Milvus + etcd + ClickHouse + Prometheus + Grafana
+# ============================================================
+services:
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: imgsrch-kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: "kCBSfKTLQhqL7JrLTEfoHA"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.12
+    container_name: imgsrch-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_RETENTION: "1"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+    command: etcd --advertise-client-urls=http://etcd:2379 --listen-client-urls=http://0.0.0.0:2379
+    volumes:
+      - etcd-data:/etcd
+    ports:
+      - "2379:2379"
+
+  # Milvus 专用 MinIO (与宿主机已有 MinIO 隔离, 避免端口和数据冲突)
+  milvus-minio:
+    image: minio/minio:latest
+    container_name: imgsrch-milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /data --console-address ":19001"
+    ports:
+      - "19000:9000"
+      - "19001:19001"
+    volumes:
+      - milvus-minio-data:/data
+
+  milvus-standalone:
+    image: milvusdb/milvus:v2.5.4
+    container_name: imgsrch-milvus
+    command: ["milvus", "run", "standalone"]
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on:
+      - etcd
+      - milvus-minio
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: imgsrch-clickhouse
+    ports:
+      - "8123:8123"
+      # 不暴露 9000 native 端口 (与 MinIO 冲突)
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: imgsrch-prometheus
+    ports:
+      - "9099:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: imgsrch-grafana
+    ports:
+      - "3002:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  kafka-data:
+    name: imgsrch-kafka-data
+  etcd-data:
+    name: imgsrch-etcd-data
+  milvus-data:
+    name: imgsrch-milvus-data
+  milvus-minio-data:
+    name: imgsrch-milvus-minio-data
+  clickhouse-data:
+    name: imgsrch-clickhouse-data
+  prometheus-data:
+    name: imgsrch-prometheus-data
+  grafana-data:
+    name: imgsrch-grafana-data

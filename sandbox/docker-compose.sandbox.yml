@@ -1,0 +1,75 @@
+# ============================================================
+# Claude Code 开发沙箱 · docker-compose
+# 使用 host 网络，直通宿主机全部端口 (PG/Redis/Kafka/Milvus...)
+# ============================================================
+services:
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HOST_UID: ${HOST_UID:-1000}
+        HOST_GID: ${HOST_GID:-1000}
+        DOCKER_GID: ${DOCKER_GID:-988}
+    image: imgsrch-sandbox:backup
+    container_name: imgsrch-sandbox
+    hostname: sandbox
+
+    stdin_open: true
+    tty: true
+
+    network_mode: host
+
+    volumes:
+      # 项目代码挂载
+      - ..:/workspace
+
+      # 数据目录
+      - /data:/data
+
+      # Docker socket 透传
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # 持久化卷
+      - claude-config:/home/dev/.claude
+      - vscode-data:/home/dev/.local/share/code-server
+      - maven-cache:/home/dev/.m2
+      - npm-cache:/home/dev/.npm
+
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # 项目服务连接 (全部指向 localhost, host 网络直通)
+      - PG_DSN=postgresql://imgsrch:imgsrch_pass@localhost:5432/image_search
+      - REDIS_URL=redis://localhost:6379/0
+      - KAFKA_BROKERS=localhost:29092
+      - MILVUS_HOST=localhost
+      - MILVUS_PORT=19530
+      - CLICKHOUSE_HOST=localhost
+      - CLICKHOUSE_PORT=8123
+
+    deploy:
+      resources:
+        limits:
+          cpus: "32"
+          memory: 64G
+        reservations:
+          cpus: "8"
+          memory: 16G
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    restart: unless-stopped
+
+volumes:
+  claude-config:
+    name: imgsrch-sandbox-claude
+  vscode-data:
+    name: imgsrch-sandbox-vscode
+  maven-cache:
+    name: imgsrch-sandbox-maven
+  npm-cache:
+    name: imgsrch-sandbox-npm
