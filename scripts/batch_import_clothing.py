@@ -376,7 +376,59 @@ class CLIPFeatureExtractor:
 
     Uses the 'openai' pretrained weights and seed=42 projection matrix,
     matching inference-service exactly.
+
+    v0.3: 新增零样本品类识别 + 标签提取 (与 inference-service 一致)
     """
+
+    # 品类词表 — 与 inference-service 保持一致
+    CATEGORIES = {
+        "服装": ["a photo of clothing", "a photo of garment", "a photo of dress shirt jacket coat pants skirt"],
+        "鞋帽": ["a photo of shoes", "a photo of boots sneakers heels hat cap"],
+        "箱包": ["a photo of bag", "a photo of handbag backpack wallet luggage purse"],
+        "珠宝玉器": ["a photo of jewelry", "a photo of jade gold diamond gem ring bracelet"],
+        "首饰配饰": ["a photo of accessories", "a photo of necklace earring brooch hairpin"],
+    }
+
+    # 标签词表 — 与 inference-service 保持一致
+    TAGS = {
+        "上衣": "a photo of a top shirt blouse",
+        "裤子": "a photo of pants trousers",
+        "裙子": "a photo of a skirt dress",
+        "外套": "a photo of a jacket coat outerwear",
+        "T恤": "a photo of a t-shirt tee",
+        "运动鞋": "a photo of sneakers running shoes",
+        "高跟鞋": "a photo of high heels pumps",
+        "皮鞋": "a photo of leather shoes",
+        "靴子": "a photo of boots",
+        "手提包": "a photo of a handbag tote bag",
+        "双肩包": "a photo of a backpack",
+        "钱包": "a photo of a wallet",
+        "旅行箱": "a photo of luggage suitcase",
+        "翡翠": "a photo of jade jadeite",
+        "黄金": "a photo of gold jewelry",
+        "钻石": "a photo of diamond",
+        "手镯": "a photo of a bracelet bangle",
+        "戒指": "a photo of a ring",
+        "项链": "a photo of a necklace",
+        "耳环": "a photo of earrings",
+        "真皮": "a photo of genuine leather product",
+        "PU皮": "a photo of PU leather synthetic product",
+        "棉质": "a photo of cotton fabric product",
+        "复古风": "a photo of vintage retro style product",
+        "简约风": "a photo of minimalist simple style product",
+        "红色": "a photo of a red product",
+        "蓝色": "a photo of a blue product",
+        "黑色": "a photo of a black product",
+        "白色": "a photo of a white product",
+        "棕色": "a photo of a brown product",
+        "春季": "a photo of spring season fashion",
+        "夏季": "a photo of summer season fashion",
+        "秋季": "a photo of autumn fall season fashion",
+        "冬季": "a photo of winter season fashion",
+    }
+
+    # 品类名 → 整数编码 (Milvus schema 用 INT32)
+    CATEGORY_ID_MAP = {name: idx for idx, name in enumerate(CATEGORIES.keys())}
 
     def __init__(self, device: str = "cuda", model_path: Optional[str] = None):
         global PROJECTION_MATRIX
@@ -407,7 +459,45 @@ class CLIPFeatureExtractor:
             PROJECTION_MATRIX = build_projection_matrix()
         self.projection = PROJECTION_MATRIX
 
-        log.info("CLIP model loaded, projection matrix initialized (512→256, seed=42)")
+        # 预计算零样本分类文本向量 (512 维)
+        self._init_zero_shot_features()
+
+        log.info("CLIP model loaded, projection matrix initialized (512→256, seed=42), "
+                 f"{len(self.category_names)} categories, {len(self.tag_names)} tags ready")
+
+    def _init_zero_shot_features(self):
+        """预计算品类/标签文本向量，用于零样本分类"""
+        tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+        # 品类文本向量
+        self.category_names = list(self.CATEGORIES.keys())
+        cat_texts = []
+        for cat_name in self.category_names:
+            cat_texts.extend(self.CATEGORIES[cat_name])
+
+        cat_tokens = tokenizer(cat_texts).to(self.device)
+        with torch.no_grad():
+            cat_feats = self.model.encode_text(cat_tokens)
+        cat_feats = cat_feats / cat_feats.norm(dim=-1, keepdim=True)
+
+        # 每个品类多个描述取平均
+        idx = 0
+        cat_avg = []
+        for cat_name in self.category_names:
+            n = len(self.CATEGORIES[cat_name])
+            avg = cat_feats[idx:idx + n].mean(dim=0)
+            avg = avg / avg.norm()
+            cat_avg.append(avg)
+            idx += n
+        self.category_text_features = torch.stack(cat_avg).float()  # (N_cat, 512)
+
+        # 标签文本向量
+        self.tag_names = list(self.TAGS.keys())
+        tag_texts = [self.TAGS[t] for t in self.tag_names]
+        tag_tokens = tokenizer(tag_texts).to(self.device)
+        with torch.no_grad():
+            tag_feats = self.model.encode_text(tag_tokens)
+        self.tag_text_features = (tag_feats / tag_feats.norm(dim=-1, keepdim=True)).float()  # (N_tag, 512)
 
     def _load_image(self, path: str) -> Optional[torch.Tensor]:
         try:
@@ -423,11 +513,48 @@ class CLIPFeatureExtractor:
         norms = np.maximum(norms, 1e-8)
         return (reduced / norms).astype(np.float32)
 
-    @torch.no_grad()
-    def extract_batch(self, paths: list[str]) -> tuple[list[str], np.ndarray]:
-        """Extract 256-dim features for a batch of image paths.
+    def _classify_batch_512(self, features_512_t: torch.Tensor,
+                            top_k: int = 8, threshold: float = 0.2) -> list[dict]:
+        """用 512 维原始特征做零样本品类/标签分类（精度最高）"""
+        feat_norm = features_512_t.float()
+        feat_norm = feat_norm / feat_norm.norm(dim=-1, keepdim=True)
 
-        Returns (valid_paths, features_256) where failed images are excluded.
+        cat_text = self.category_text_features.to(self.device)  # (N_cat, 512)
+        tag_text = self.tag_text_features.to(self.device)       # (N_tag, 512)
+
+        cat_sims = feat_norm @ cat_text.T  # (B, N_cat)
+        tag_sims = feat_norm @ tag_text.T  # (B, N_tag)
+
+        top_k = min(top_k, len(self.tag_names))
+        results = []
+        for i in range(len(features_512_t)):
+            cat_idx = cat_sims[i].argmax().item()
+            cat_conf = cat_sims[i][cat_idx].item()
+            cat_name = self.category_names[cat_idx]
+
+            topk_result = tag_sims[i].topk(top_k)
+            tags = [
+                self.tag_names[j]
+                for j, s in zip(topk_result.indices.tolist(), topk_result.values.tolist())
+                if s > threshold
+            ]
+            # 标签 hash 编码 (与 inference-service 一致)
+            tag_ids = [hash(t) % 4096 for t in tags]
+
+            results.append({
+                "category_l1": cat_name,
+                "category_l1_id": self.CATEGORY_ID_MAP[cat_name],
+                "category_l1_conf": round(cat_conf, 4),
+                "tags_name": tags,
+                "tags": tag_ids,
+            })
+        return results
+
+    @torch.no_grad()
+    def extract_batch(self, paths: list[str]) -> tuple[list[str], np.ndarray, list[dict]]:
+        """Extract 256-dim features + zero-shot classification for a batch.
+
+        Returns (valid_paths, features_256, classifications).
         """
         tensors = []
         valid_paths = []
@@ -438,34 +565,42 @@ class CLIPFeatureExtractor:
                 valid_paths.append(p)
 
         if not tensors:
-            return [], np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+            return [], np.empty((0, EMBEDDING_DIM), dtype=np.float32), []
 
         batch = torch.stack(tensors).to(self.device)
         features = self.model.encode_image(batch)
-        features_512 = features.cpu().numpy().astype(np.float32)
 
-        # Project to 256-dim (no PCA, uses fixed orthogonal projection)
+        # 零样本分类 (用 512 维原始特征，精度最高)
+        classifications = self._classify_batch_512(features)
+
+        features_512 = features.cpu().numpy().astype(np.float32)
+        # Project to 256-dim
         features_256 = self._project(features_512)
 
-        return valid_paths, features_256
+        return valid_paths, features_256, classifications
 
     def extract_all(self, image_metas: list[dict]) -> list[dict]:
-        """Extract features for all images. Updates metas with 'global_vec'."""
+        """Extract features + zero-shot classification for all images.
+
+        Updates metas with 'global_vec', 'category_l1', 'tags', etc.
+        """
         paths = [m["local_path"] for m in image_metas]
         path_to_meta = {m["local_path"]: m for m in image_metas}
 
         all_256 = []
         all_valid_paths = []
+        all_classifications = []
 
         total_batches = (len(paths) + GPU_BATCH_SIZE - 1) // GPU_BATCH_SIZE
-        log.info(f"Extracting features: {len(paths)} images, {total_batches} batches "
-                 f"(batch_size={GPU_BATCH_SIZE})")
+        log.info(f"Extracting features + classifying: {len(paths)} images, "
+                 f"{total_batches} batches (batch_size={GPU_BATCH_SIZE})")
 
         t0 = time.time()
         for i in range(0, len(paths), GPU_BATCH_SIZE):
             batch_paths = paths[i : i + GPU_BATCH_SIZE]
-            valid_paths, features_256 = self.extract_batch(batch_paths)
+            valid_paths, features_256, classifications = self.extract_batch(batch_paths)
             all_valid_paths.extend(valid_paths)
+            all_classifications.extend(classifications)
             if len(features_256) > 0:
                 all_256.append(features_256)
 
@@ -485,14 +620,25 @@ class CLIPFeatureExtractor:
         all_256 = np.concatenate(all_256, axis=0)
         log.info(f"Projection done: {all_256.shape} in {time.time()-t0:.1f}s")
 
+        # 统计品类分布
+        cat_counts: dict[str, int] = {}
+        for cls in all_classifications:
+            cat_counts[cls["category_l1"]] = cat_counts.get(cls["category_l1"], 0) + 1
+        log.info(f"Category distribution: {cat_counts}")
+
         # Map back to metas
         result = []
-        for path, vec in zip(all_valid_paths, all_256):
+        for path, vec, cls in zip(all_valid_paths, all_256, all_classifications):
             meta = path_to_meta[path]
             meta["global_vec"] = vec.tolist()
+            meta["category_l1"] = cls["category_l1_id"]
+            meta["category_l1_name"] = cls["category_l1"]
+            meta["category_l1_conf"] = cls["category_l1_conf"]
+            meta["tags"] = cls["tags"]
+            meta["tags_name"] = cls["tags_name"]
             result.append(meta)
 
-        log.info(f"Feature extraction complete: {len(result)} images")
+        log.info(f"Feature extraction + classification complete: {len(result)} images")
         return result
 
 
@@ -649,17 +795,18 @@ CLOTHING_CATEGORIES_L2 = {
 
 
 def enrich_metadata(image_metas: list[dict]):
-    """Add category/tag metadata based on URI patterns or index."""
+    """Add metadata: product_id, merchant_id. Category/tags from CLIP zero-shot."""
     import random as _random
 
     for m in image_metas:
-        m["category_l1"] = 1
-        m["category_l2"] = 101
+        # category_l1 / tags 已由 CLIPFeatureExtractor 填充，这里只补充缺省值
+        m.setdefault("category_l1", 0)
+        m.setdefault("category_l2", 0)
         m["category_l3"] = 0
         m["product_id"] = f"P0{m['index']:07d}"
         merchant_num = _random.randint(MERCHANT_ID_START, MERCHANT_ID_END)
         m["merchant_id"] = f"T20260101{merchant_num}"
-        m["tags"] = [m["category_l1"]]
+        m.setdefault("tags", [])
 
 
 # ── 8. Local Backup ──────────────────────────────────────────────────────────
@@ -688,9 +835,12 @@ def save_backup(image_metas: list[dict], backup_dir: str):
                 "image_pk": m["image_pk"],
                 "global_vec": m.get("global_vec"),
                 "category_l1": m.get("category_l1"),
+                "category_l1_name": m.get("category_l1_name"),
+                "category_l1_conf": m.get("category_l1_conf"),
                 "category_l2": m.get("category_l2"),
                 "product_id": m.get("product_id"),
                 "tags": m.get("tags"),
+                "tags_name": m.get("tags_name"),
                 "local_image": os.path.basename(src) if src else None,
             }
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -789,10 +939,7 @@ async def async_main(args):
 
     _save_ckpt("download", len(image_metas))
 
-    # Step 3: Enrich metadata
-    enrich_metadata(image_metas)
-
-    # Step 4: Extract features
+    # Step 3: Extract features + zero-shot classification
     emit_progress("extract", 0, len(image_metas), "Loading CLIP model...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -804,8 +951,12 @@ async def async_main(args):
         log.error("Feature extraction produced no results, aborting")
         emit_progress("error", 0, 0, "Feature extraction produced no results")
         return
-    log.info(f"Features extracted for {len(image_metas)} images")
-    emit_progress("extract", len(image_metas), len(image_metas), f"Extracted features for {len(image_metas)} images")
+    log.info(f"Features extracted + classified for {len(image_metas)} images")
+    emit_progress("extract", len(image_metas), len(image_metas),
+                  f"Extracted + classified {len(image_metas)} images")
+
+    # Step 4: Enrich metadata (product_id, merchant_id — categories already filled)
+    enrich_metadata(image_metas)
     _save_ckpt("extract", len(image_metas))
 
     # Step 5: Write to Milvus

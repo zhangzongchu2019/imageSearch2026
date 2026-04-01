@@ -41,6 +41,8 @@ _lock = threading.Lock()  # GPU 序列化锁
 # 零样本分类 — 预计算文本向量
 _category_text_features: torch.Tensor | None = None  # (N_cat, 512)
 _tag_text_features: torch.Tensor | None = None        # (N_tag, 512)
+_category_text_features_256: torch.Tensor | None = None  # (N_cat, 256) 投影后
+_tag_text_features_256: torch.Tensor | None = None        # (N_tag, 256) 投影后
 _category_names: List[str] = []
 _tag_names: List[str] = []
 
@@ -105,6 +107,7 @@ def _load_model():
     """加载 CLIP ViT-B/32 并初始化投影矩阵 + 零样本分类文本向量"""
     global _model, _preprocess, _tokenizer, _projection, _device
     global _category_text_features, _tag_text_features, _category_names, _tag_names
+    global _category_text_features_256, _tag_text_features_256
     import open_clip
 
     # 选择设备
@@ -187,8 +190,18 @@ def _load_model():
         tag_feats = _model.encode_text(tag_tokens)  # (N, 512)
     _tag_text_features = tag_feats / tag_feats.norm(dim=-1, keepdim=True)
 
+    # ── 预计算 256 维投影文本特征（用于从已有 256 维向量分类）──
+    proj_fp32 = _projection.float()
+    cat_proj = (_category_text_features.float() @ proj_fp32)  # (N_cat, 256)
+    cat_proj = cat_proj / cat_proj.norm(dim=-1, keepdim=True)
+    _category_text_features_256 = cat_proj.to(_device)
+
+    tag_proj = (_tag_text_features.float() @ proj_fp32)  # (N_tag, 256)
+    tag_proj = tag_proj / tag_proj.norm(dim=-1, keepdim=True)
+    _tag_text_features_256 = tag_proj.to(_device)
+
     logger.info(
-        "CLIP ViT-B/32 loaded on %s, %d categories, %d tags ready",
+        "CLIP ViT-B/32 loaded on %s, %d categories, %d tags ready (512d + 256d text features)",
         _device, len(_category_names), len(_tag_names),
     )
 
@@ -235,6 +248,72 @@ def _do_inference(image_bytes: bytes) -> dict:
     }
 
 
+def _classify_from_vec256(vec_256: List[float], top_k_tags: int = 8, tag_threshold: float = 0.2) -> dict:
+    """从 256 维投影向量做零样本品类/标签分类"""
+    vec_t = torch.tensor(vec_256, dtype=torch.float32, device=_device).unsqueeze(0)  # (1, 256)
+    vec_t = vec_t / vec_t.norm(dim=-1, keepdim=True)
+
+    # 品类分类
+    cat_sims = (vec_t @ _category_text_features_256.float().T).squeeze(0)  # (N_cat,)
+    cat_idx = cat_sims.argmax().item()
+    cat_conf = cat_sims[cat_idx].item()
+    category_l1 = _category_names[cat_idx]
+
+    # 标签提取
+    tag_sims = (vec_t @ _tag_text_features_256.float().T).squeeze(0)  # (N_tag,)
+    top_k = min(top_k_tags, len(_tag_names))
+    topk_result = tag_sims.topk(top_k)
+    top_indices = topk_result.indices.tolist()
+    top_scores = topk_result.values.tolist()
+    tags = [
+        {"name": _tag_names[i], "score": round(s, 4)}
+        for i, s in zip(top_indices, top_scores)
+        if s > tag_threshold
+    ]
+
+    return {
+        "category_l1": category_l1,
+        "category_l1_conf": round(cat_conf, 4),
+        "category_l1_id": cat_idx,
+        "tags": tags,
+    }
+
+
+def _classify_batch_vec256(vectors: List[List[float]], top_k_tags: int = 8, tag_threshold: float = 0.2) -> List[dict]:
+    """批量 256 维向量分类"""
+    batch_t = torch.tensor(vectors, dtype=torch.float32, device=_device)  # (B, 256)
+    batch_t = batch_t / batch_t.norm(dim=-1, keepdim=True)
+
+    cat_text = _category_text_features_256.float()  # (N_cat, 256)
+    tag_text = _tag_text_features_256.float()        # (N_tag, 256)
+
+    cat_sims = batch_t @ cat_text.T  # (B, N_cat)
+    tag_sims = batch_t @ tag_text.T  # (B, N_tag)
+
+    top_k = min(top_k_tags, len(_tag_names))
+    results = []
+    for i in range(len(vectors)):
+        cat_idx = cat_sims[i].argmax().item()
+        cat_conf = cat_sims[i][cat_idx].item()
+
+        topk_result = tag_sims[i].topk(top_k)
+        top_indices = topk_result.indices.tolist()
+        top_scores = topk_result.values.tolist()
+        tags = [
+            {"name": _tag_names[j], "score": round(s, 4)}
+            for j, s in zip(top_indices, top_scores)
+            if s > tag_threshold
+        ]
+
+        results.append({
+            "category_l1": _category_names[cat_idx],
+            "category_l1_conf": round(cat_conf, 4),
+            "category_l1_id": cat_idx,
+            "tags": tags,
+        })
+    return results
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_model()
@@ -278,6 +357,85 @@ async def extract(req: ExtractRequest):
         tags=result["tags"],
         tags_pred=tag_ids,
         category_l1_pred=cat_id,
+    )
+
+
+# ── 向量分类接口 ──
+
+
+class TagItem(BaseModel):
+    name: str
+    score: float
+
+
+class ClassifyRequest(BaseModel):
+    global_vec: list[float]
+    top_k_tags: int = 8
+    tag_threshold: float = 0.2
+
+
+class ClassifyResponse(BaseModel):
+    category_l1: str
+    category_l1_conf: float
+    category_l1_id: int
+    tags: list[TagItem]
+
+
+class ClassifyBatchRequest(BaseModel):
+    vectors: list[list[float]]
+    top_k_tags: int = 8
+    tag_threshold: float = 0.2
+
+
+class ClassifyBatchResponse(BaseModel):
+    results: list[ClassifyResponse]
+    count: int
+
+
+@app.post("/api/v1/classify", response_model=ClassifyResponse)
+async def classify(req: ClassifyRequest):
+    """从 256 维向量获取品类和标签"""
+    if len(req.global_vec) != EMBEDDING_DIM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {EMBEDDING_DIM}-dim vector, got {len(req.global_vec)}",
+        )
+    result = _classify_from_vec256(req.global_vec, req.top_k_tags, req.tag_threshold)
+    return ClassifyResponse(
+        category_l1=result["category_l1"],
+        category_l1_conf=result["category_l1_conf"],
+        category_l1_id=result["category_l1_id"],
+        tags=[TagItem(**t) for t in result["tags"]],
+    )
+
+
+@app.post("/api/v1/classify_batch", response_model=ClassifyBatchResponse)
+async def classify_batch(req: ClassifyBatchRequest):
+    """批量 256 维向量分类，单次最多 1000 条"""
+    if len(req.vectors) > 1000:
+        raise HTTPException(status_code=400, detail="Max 1000 vectors per batch")
+    for i, v in enumerate(req.vectors):
+        if len(v) != EMBEDDING_DIM:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Vector[{i}]: expected {EMBEDDING_DIM}-dim, got {len(v)}",
+            )
+
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(
+        None, _classify_batch_vec256, req.vectors, req.top_k_tags, req.tag_threshold,
+    )
+    return ClassifyBatchResponse(
+        results=[
+            ClassifyResponse(
+                category_l1=r["category_l1"],
+                category_l1_conf=r["category_l1_conf"],
+                category_l1_id=r["category_l1_id"],
+                tags=[TagItem(**t) for t in r["tags"]],
+            )
+            for r in results
+        ],
+        count=len(results),
     )
 
 
