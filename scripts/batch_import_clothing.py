@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-批量导入服装图片到 Milvus + PostgreSQL
+批量导入图片到 Milvus + PostgreSQL (两级分类架构 v2.0)
 
-使用 open-clip-torch (ViT-B/32, openai 预训练) 提取 512 维特征，
-正交随机投影降维到 256 维（与 inference-service seed=42 一致），
+使用 ViT-L-14 (768维) + FashionSigLIP 两级分类:
+  Stage 1: ViT-L-14 → L1 大类(18类) + 标签 + 768→256 搜索向量
+  Stage 2: FashionSigLIP (时尚类 L2/L3) / ViT-L-14 零样本 (其他类 L2)
 直接批量写入 Milvus global_images_hot 和 PG uri_dedup。
 
 Usage:
@@ -49,7 +50,7 @@ def emit_progress(stage: str, completed: int, total: int, message: str):
 
 # ── Constants ────────────────────────────────────────────────────────────────
 EMBEDDING_DIM = 256
-CLIP_DIM = 512
+CLIP_DIM = 768  # ViT-L-14
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 PG_DSN = os.getenv("PG_DSN", "postgresql://imgsrch:imgsrch_pass@localhost:5432/image_search")
@@ -150,12 +151,12 @@ class TaskTracker:
 
 # ── Projection Matrix (matches inference-service exactly) ─────────────────
 def build_projection_matrix() -> np.ndarray:
-    """Build orthogonal projection matrix (512 → 256), seed=42.
-    Identical to inference-service/app/main.py."""
+    """Build orthogonal projection matrix (768 → 256), seed=42.
+    Identical to inference-service/app/main.py (ViT-L-14)."""
     rng = np.random.RandomState(42)
     proj = rng.randn(CLIP_DIM, EMBEDDING_DIM).astype(np.float32)
     u, _, vt = np.linalg.svd(proj, full_matrices=False)
-    return u  # (512, 256) orthogonal matrix
+    return u  # (768, 256) orthogonal matrix
 
 
 PROJECTION_MATRIX = None  # lazy init
@@ -461,132 +462,177 @@ async def download_images(
 # ── 3. Feature Extraction (CLIP + Orthogonal Projection) ─────────────────────
 
 class CLIPFeatureExtractor:
-    """CLIP ViT-B/32 feature extractor with orthogonal projection 512→256.
+    """ViT-L-14 feature extractor with orthogonal projection 768→256.
 
-    Uses the 'openai' pretrained weights and seed=42 projection matrix,
-    matching inference-service exactly.
+    两级分类架构:
+      Stage 1: ViT-L-14 → 768维 → L1 大类 + 标签 + 256维搜索向量
+      Stage 2: FashionSigLIP (时尚类 L2/L3) / ViT-L-14零样本 (其他类 L2)
 
-    v0.3: 新增零样本品类识别 + 标签提取 (与 inference-service 一致)
+    与 inference-service v2.0 taxonomy.py 保持一致。
     """
-
-    # 品类词表 — 与 inference-service 保持一致
-    CATEGORIES = {
-        "服装": ["a photo of clothing", "a photo of garment", "a photo of dress shirt jacket coat pants skirt"],
-        "鞋帽": ["a photo of shoes", "a photo of boots sneakers heels hat cap"],
-        "箱包": ["a photo of bag", "a photo of handbag backpack wallet luggage purse"],
-        "珠宝玉器": ["a photo of jewelry", "a photo of jade gold diamond gem ring bracelet"],
-        "首饰配饰": ["a photo of accessories", "a photo of necklace earring brooch hairpin"],
-    }
-
-    # 标签词表 — 与 inference-service 保持一致
-    TAGS = {
-        "上衣": "a photo of a top shirt blouse",
-        "裤子": "a photo of pants trousers",
-        "裙子": "a photo of a skirt dress",
-        "外套": "a photo of a jacket coat outerwear",
-        "T恤": "a photo of a t-shirt tee",
-        "运动鞋": "a photo of sneakers running shoes",
-        "高跟鞋": "a photo of high heels pumps",
-        "皮鞋": "a photo of leather shoes",
-        "靴子": "a photo of boots",
-        "手提包": "a photo of a handbag tote bag",
-        "双肩包": "a photo of a backpack",
-        "钱包": "a photo of a wallet",
-        "旅行箱": "a photo of luggage suitcase",
-        "翡翠": "a photo of jade jadeite",
-        "黄金": "a photo of gold jewelry",
-        "钻石": "a photo of diamond",
-        "手镯": "a photo of a bracelet bangle",
-        "戒指": "a photo of a ring",
-        "项链": "a photo of a necklace",
-        "耳环": "a photo of earrings",
-        "真皮": "a photo of genuine leather product",
-        "PU皮": "a photo of PU leather synthetic product",
-        "棉质": "a photo of cotton fabric product",
-        "复古风": "a photo of vintage retro style product",
-        "简约风": "a photo of minimalist simple style product",
-        "红色": "a photo of a red product",
-        "蓝色": "a photo of a blue product",
-        "黑色": "a photo of a black product",
-        "白色": "a photo of a white product",
-        "棕色": "a photo of a brown product",
-        "春季": "a photo of spring season fashion",
-        "夏季": "a photo of summer season fashion",
-        "秋季": "a photo of autumn fall season fashion",
-        "冬季": "a photo of winter season fashion",
-    }
-
-    # 品类名 → 整数编码 (Milvus schema 用 INT32)
-    CATEGORY_ID_MAP = {name: idx for idx, name in enumerate(CATEGORIES.keys())}
 
     def __init__(self, device: str = "cuda", model_path: Optional[str] = None):
         global PROJECTION_MATRIX
+        # 导入 taxonomy (inference-service 中定义)
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "services" / "inference-service"))
+        from app.taxonomy import (
+            L1_CATEGORIES, L1_CODES, L1_CODE_TO_NAME,
+            FASHION_L1_CODES, FASHION_L2, FASHION_L3,
+            NONFASHION_L2, TAGS, TAG_NAMES, is_fashion,
+        )
+        self._taxonomy = {
+            "L1_CATEGORIES": L1_CATEGORIES, "L1_CODES": L1_CODES,
+            "L1_CODE_TO_NAME": L1_CODE_TO_NAME,
+            "FASHION_L1_CODES": FASHION_L1_CODES,
+            "FASHION_L2": FASHION_L2, "FASHION_L3": FASHION_L3,
+            "NONFASHION_L2": NONFASHION_L2,
+            "TAGS": TAGS, "TAG_NAMES": TAG_NAMES,
+            "is_fashion": is_fashion,
+        }
 
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        log.info(f"Loading CLIP ViT-B/32 on {self.device}...")
+        log.info(f"Loading ViT-L-14 on {self.device}...")
 
-        # Monkey-patch torch.load for PyTorch 2.6+ compatibility
         _orig_torch_load = torch.load
         torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
 
+        model_name = "ViT-L-14"
         if model_path and os.path.exists(model_path):
-            log.info(f"Loading from local checkpoint: {model_path}")
+            log.info(f"Loading from local: {model_path}")
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-                "ViT-B-32", pretrained=model_path, device=self.device,
+                model_name, pretrained=model_path, device=self.device,
             )
         else:
-            log.info("Downloading CLIP ViT-B/32 (openai pretrained) ...")
+            log.info("Downloading ViT-L-14 (openai pretrained)...")
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-                "ViT-B-32", pretrained="openai", device=self.device,
+                model_name, pretrained="openai", device=self.device,
             )
-
-        torch.load = _orig_torch_load  # restore
+        torch.load = _orig_torch_load
         self.model.eval()
+        self.tokenizer = open_clip.get_tokenizer(model_name)
 
-        # Build projection matrix (same as inference-service)
         if PROJECTION_MATRIX is None:
             PROJECTION_MATRIX = build_projection_matrix()
         self.projection = PROJECTION_MATRIX
 
-        # 预计算零样本分类文本向量 (512 维)
-        self._init_zero_shot_features()
+        # 预计算文本特征
+        self._init_text_features()
 
-        log.info("CLIP model loaded, projection matrix initialized (512→256, seed=42), "
-                 f"{len(self.category_names)} categories, {len(self.tag_names)} tags ready")
+        # 尝试加载 FashionSigLIP
+        self.fashion_model = None
+        self._init_fashion_model()
 
-    def _init_zero_shot_features(self):
-        """预计算品类/标签文本向量，用于零样本分类"""
-        tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        log.info(f"Models loaded: ViT-L-14 (768→256), "
+                 f"{len(self.l1_names)} L1, {len(self.tag_names)} tags, "
+                 f"FashionSigLIP={'loaded' if self.fashion_model else 'not loaded'}")
 
-        # 品类文本向量
-        self.category_names = list(self.CATEGORIES.keys())
-        cat_texts = []
-        for cat_name in self.category_names:
-            cat_texts.extend(self.CATEGORIES[cat_name])
+    def _encode_text(self, prompts_dict, multi_prompt=True):
+        """编码文本特征 (复用 inference-service 逻辑)"""
+        names, all_texts, counts = [], [], []
+        for name_key, prompts in prompts_dict.items():
+            names.append(name_key)
+            if isinstance(prompts, str):
+                prompts = [prompts]
+            all_texts.extend(prompts)
+            counts.append(len(prompts))
 
-        cat_tokens = tokenizer(cat_texts).to(self.device)
+        tokens = self.tokenizer(all_texts).to(self.device)
         with torch.no_grad():
-            cat_feats = self.model.encode_text(cat_tokens)
-        cat_feats = cat_feats / cat_feats.norm(dim=-1, keepdim=True)
+            feats = self.model.encode_text(tokens)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
 
-        # 每个品类多个描述取平均
-        idx = 0
-        cat_avg = []
-        for cat_name in self.category_names:
-            n = len(self.CATEGORIES[cat_name])
-            avg = cat_feats[idx:idx + n].mean(dim=0)
-            avg = avg / avg.norm()
-            cat_avg.append(avg)
-            idx += n
-        self.category_text_features = torch.stack(cat_avg).float()  # (N_cat, 512)
+        if multi_prompt and any(c > 1 for c in counts):
+            averaged = []
+            idx = 0
+            for c in counts:
+                avg = feats[idx:idx + c].mean(dim=0)
+                avg = avg / avg.norm()
+                averaged.append(avg)
+                idx += c
+            return names, torch.stack(averaged)
+        return names, feats
 
-        # 标签文本向量
-        self.tag_names = list(self.TAGS.keys())
-        tag_texts = [self.TAGS[t] for t in self.tag_names]
-        tag_tokens = tokenizer(tag_texts).to(self.device)
-        with torch.no_grad():
-            tag_feats = self.model.encode_text(tag_tokens)
-        self.tag_text_features = (tag_feats / tag_feats.norm(dim=-1, keepdim=True)).float()  # (N_tag, 512)
+    def _init_text_features(self):
+        """预计算 L1 品类 + 标签 + 非时尚 L2 文本特征"""
+        T = self._taxonomy
+
+        # L1 品类
+        self.l1_codes = T["L1_CODES"]
+        self.l1_names = [T["L1_CODE_TO_NAME"][c] for c in self.l1_codes]
+        l1_prompts = {T["L1_CATEGORIES"][c]["name"]: T["L1_CATEGORIES"][c]["prompts"]
+                      for c in self.l1_codes}
+        _, self.l1_text_features = self._encode_text(l1_prompts)
+
+        # 标签
+        self.tag_names = T["TAG_NAMES"]
+        tag_prompts = {n: T["TAGS"][n] for n in self.tag_names}
+        _, self.tag_text_features = self._encode_text(tag_prompts)
+
+        # 非时尚类 L2
+        self.nf_l2_features = {}
+        self.nf_l2_names = {}
+        self.nf_l2_codes = {}
+        for l1_code, l2_dict in T["NONFASHION_L2"].items():
+            prompts = {info["name"]: info["prompts"] for info in l2_dict.values()}
+            codes = list(l2_dict.keys())
+            names, feats = self._encode_text(prompts)
+            self.nf_l2_features[l1_code] = feats
+            self.nf_l2_names[l1_code] = names
+            self.nf_l2_codes[l1_code] = codes
+
+    def _init_fashion_model(self):
+        """尝试加载 FashionSigLIP"""
+        T = self._taxonomy
+        try:
+            fashion_path = os.environ.get("FASHION_MODEL_PATH", "/data/imgsrch/models/marqo-fashionsiglip")
+            self.fashion_model, _, self.fashion_preprocess = open_clip.create_model_and_transforms(
+                "hf-hub:Marqo/marqo-fashionSigLIP",
+                cache_dir=fashion_path if os.path.isdir(fashion_path) else None,
+            )
+            self.fashion_tokenizer = open_clip.get_tokenizer("hf-hub:Marqo/marqo-fashionSigLIP")
+            self.fashion_model.eval().to(self.device)
+            log.info("FashionSigLIP loaded")
+
+            # 时尚 L2/L3 文本特征
+            self.fashion_l2_features = {}
+            self.fashion_l2_names = {}
+            self.fashion_l2_codes = {}
+            for l1_code, l2_dict in T["FASHION_L2"].items():
+                prompts = {info["name"]: info["prompts"] for info in l2_dict.values()}
+                codes = list(l2_dict.keys())
+                tokens_list = []
+                for p_list in prompts.values():
+                    tokens_list.extend(p_list if isinstance(p_list, list) else [p_list])
+                names = list(prompts.keys())
+                toks = self.fashion_tokenizer(tokens_list).to(self.device)
+                with torch.no_grad():
+                    feats = self.fashion_model.encode_text(toks)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                self.fashion_l2_features[l1_code] = feats
+                self.fashion_l2_names[l1_code] = names
+                self.fashion_l2_codes[l1_code] = codes
+
+            self.fashion_l3_features = {}
+            self.fashion_l3_names = {}
+            self.fashion_l3_codes = {}
+            for l2_code, l3_dict in T["FASHION_L3"].items():
+                prompts = {info["name"]: info["prompts"] for info in l3_dict.values()}
+                codes = list(l3_dict.keys())
+                tokens_list = []
+                for p_list in prompts.values():
+                    tokens_list.extend(p_list if isinstance(p_list, list) else [p_list])
+                names = list(prompts.keys())
+                toks = self.fashion_tokenizer(tokens_list).to(self.device)
+                with torch.no_grad():
+                    feats = self.fashion_model.encode_text(toks)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                self.fashion_l3_features[l2_code] = feats
+                self.fashion_l3_names[l2_code] = names
+                self.fashion_l3_codes[l2_code] = codes
+
+        except Exception as e:
+            log.warning(f"FashionSigLIP not loaded: {e}")
+            self.fashion_model = None
 
     def _load_image(self, path: str) -> Optional[torch.Tensor]:
         try:
@@ -595,31 +641,32 @@ class CLIPFeatureExtractor:
         except Exception:
             return None
 
-    def _project(self, features_512: np.ndarray) -> np.ndarray:
-        """Project 512-dim features to 256-dim using orthogonal matrix + L2 normalize."""
-        reduced = features_512 @ self.projection  # (N, 256)
+    def _project(self, features_768: np.ndarray) -> np.ndarray:
+        """Project 768-dim features to 256-dim using orthogonal matrix + L2 normalize."""
+        reduced = features_768 @ self.projection  # (N, 256)
         norms = np.linalg.norm(reduced, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-8)
         return (reduced / norms).astype(np.float32)
 
-    def _classify_batch_512(self, features_512_t: torch.Tensor,
-                            top_k: int = 8, threshold: float = 0.2) -> list[dict]:
-        """用 512 维原始特征做零样本品类/标签分类（精度最高）"""
-        feat_norm = features_512_t.float()
+    def _classify_batch_l1(self, features_t: torch.Tensor,
+                           top_k: int = 8, threshold: float = 0.2) -> list[dict]:
+        """用 768 维原始特征做 L1 品类/标签分类"""
+        feat_norm = features_t.float()
         feat_norm = feat_norm / feat_norm.norm(dim=-1, keepdim=True)
 
-        cat_text = self.category_text_features.to(self.device)  # (N_cat, 512)
-        tag_text = self.tag_text_features.to(self.device)       # (N_tag, 512)
+        l1_text = self.l1_text_features.float().to(self.device)
+        tag_text = self.tag_text_features.float().to(self.device)
 
-        cat_sims = feat_norm @ cat_text.T  # (B, N_cat)
-        tag_sims = feat_norm @ tag_text.T  # (B, N_tag)
+        l1_sims = feat_norm @ l1_text.T
+        tag_sims = feat_norm @ tag_text.T
 
         top_k = min(top_k, len(self.tag_names))
         results = []
-        for i in range(len(features_512_t)):
-            cat_idx = cat_sims[i].argmax().item()
-            cat_conf = cat_sims[i][cat_idx].item()
-            cat_name = self.category_names[cat_idx]
+        for i in range(len(features_t)):
+            l1_idx = l1_sims[i].argmax().item()
+            l1_conf = l1_sims[i][l1_idx].item()
+            l1_name = self.l1_names[l1_idx]
+            l1_code = self.l1_codes[l1_idx]
 
             topk_result = tag_sims[i].topk(top_k)
             tags = [
@@ -627,24 +674,73 @@ class CLIPFeatureExtractor:
                 for j, s in zip(topk_result.indices.tolist(), topk_result.values.tolist())
                 if s > threshold
             ]
-            # 标签 hash 编码 (与 inference-service 一致)
             tag_ids = [hash(t) % 4096 for t in tags]
 
+            # L2 (非时尚类直接用 ViT-L-14)
+            l2_name, l2_code, l2_conf = "", 0, 0.0
+            if not self._taxonomy["is_fashion"](l1_code) and l1_code in self.nf_l2_features:
+                l2_feats = self.nf_l2_features[l1_code].float().to(self.device)
+                l2_sims = (feat_norm[i:i+1] @ l2_feats.T).squeeze(0)
+                l2_idx = l2_sims.argmax().item()
+                l2_conf = l2_sims[l2_idx].item()
+                l2_name = self.nf_l2_names[l1_code][l2_idx]
+                l2_code = self.nf_l2_codes[l1_code][l2_idx]
+
             results.append({
-                "category_l1": cat_name,
-                "category_l1_id": self.CATEGORY_ID_MAP[cat_name],
-                "category_l1_conf": round(cat_conf, 4),
+                "category_l1": l1_name,
+                "category_l1_id": l1_code,
+                "category_l1_conf": round(l1_conf, 4),
+                "category_l2": l2_name,
+                "category_l2_id": l2_code,
+                "category_l3": "",
+                "category_l3_id": 0,
                 "tags_name": tags,
                 "tags": tag_ids,
+                "_is_fashion": self._taxonomy["is_fashion"](l1_code),
             })
         return results
 
+    def _classify_fashion_l2l3(self, paths: list[str], classifications: list[dict]):
+        """对时尚类图片做 FashionSigLIP L2/L3 分类"""
+        if self.fashion_model is None:
+            return
+
+        for i, cls in enumerate(classifications):
+            if not cls["_is_fashion"]:
+                continue
+            l1_code = cls["category_l1_id"]
+            if l1_code not in self.fashion_l2_features:
+                continue
+
+            try:
+                img = Image.open(paths[i]).convert("RGB")
+                img_tensor = self.fashion_preprocess(img).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    feat = self.fashion_model.encode_image(img_tensor)
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+
+                # L2
+                l2_feats = self.fashion_l2_features[l1_code].float()
+                l2_sims = (feat.float() @ l2_feats.T).squeeze(0)
+                l2_idx = l2_sims.argmax().item()
+                cls["category_l2"] = self.fashion_l2_names[l1_code][l2_idx]
+                cls["category_l2_id"] = self.fashion_l2_codes[l1_code][l2_idx]
+
+                # L3
+                l2_code = cls["category_l2_id"]
+                if l2_code in self.fashion_l3_features:
+                    l3_feats = self.fashion_l3_features[l2_code].float()
+                    l3_sims = (feat.float() @ l3_feats.T).squeeze(0)
+                    l3_idx = l3_sims.argmax().item()
+                    cls["category_l3"] = self.fashion_l3_names[l2_code][l3_idx]
+                    cls["category_l3_id"] = self.fashion_l3_codes[l2_code][l3_idx]
+
+            except Exception as e:
+                log.warning(f"FashionSigLIP classify failed for {paths[i]}: {e}")
+
     @torch.no_grad()
     def extract_batch(self, paths: list[str]) -> tuple[list[str], np.ndarray, list[dict]]:
-        """Extract 256-dim features + zero-shot classification for a batch.
-
-        Returns (valid_paths, features_256, classifications).
-        """
+        """Extract 256-dim features + two-stage classification for a batch."""
         tensors = []
         valid_paths = []
         for p in paths:
@@ -657,22 +753,21 @@ class CLIPFeatureExtractor:
             return [], np.empty((0, EMBEDDING_DIM), dtype=np.float32), []
 
         batch = torch.stack(tensors).to(self.device)
-        features = self.model.encode_image(batch)
+        features = self.model.encode_image(batch)  # (B, 768)
 
-        # 零样本分类 (用 512 维原始特征，精度最高)
-        classifications = self._classify_batch_512(features)
+        # Stage 1: L1 分类 + 标签 + 非时尚 L2
+        classifications = self._classify_batch_l1(features)
 
-        features_512 = features.cpu().numpy().astype(np.float32)
-        # Project to 256-dim
-        features_256 = self._project(features_512)
+        # Stage 2: 时尚类 L2/L3 (FashionSigLIP)
+        self._classify_fashion_l2l3(valid_paths, classifications)
+
+        features_768 = features.cpu().numpy().astype(np.float32)
+        features_256 = self._project(features_768)
 
         return valid_paths, features_256, classifications
 
     def extract_all(self, image_metas: list[dict]) -> list[dict]:
-        """Extract features + zero-shot classification for all images.
-
-        Updates metas with 'global_vec', 'category_l1', 'tags', etc.
-        """
+        """Extract features + two-stage classification for all images."""
         paths = [m["local_path"] for m in image_metas]
         path_to_meta = {m["local_path"]: m for m in image_metas}
 
@@ -723,6 +818,8 @@ class CLIPFeatureExtractor:
             meta["category_l1"] = cls["category_l1_id"]
             meta["category_l1_name"] = cls["category_l1"]
             meta["category_l1_conf"] = cls["category_l1_conf"]
+            meta["category_l2"] = cls.get("category_l2_id", 0)
+            meta["category_l3"] = cls.get("category_l3_id", 0)
             meta["tags"] = cls["tags"]
             meta["tags_name"] = cls["tags_name"]
             result.append(meta)

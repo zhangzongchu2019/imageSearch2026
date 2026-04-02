@@ -239,9 +239,9 @@ async def _process_new_image(deps, image_pk: str, req: UpdateImageRequest, trace
         data = {
             "image_pk": image_pk,
             "global_vec": features.global_vec,
-            "category_l1": cat_l1_code,
-            "category_l2": 0,
-            "category_l3": 0,
+            "category_l1": features.category_l1_pred if features.category_l1_pred else cat_l1_code,
+            "category_l2": features.category_l2_pred,
+            "category_l3": features.category_l3_pred,
             "tags": tag_codes if tag_codes else [0],
             "color_code": 0,
             "material_code": 0,
@@ -418,12 +418,14 @@ async def _download_image(uri: str, timeout: float = 10.0, retries: int = 3) -> 
 
 class _FeatureResult:
     """特征提取结果"""
-    __slots__ = ("global_vec", "tags_pred", "category_l1_pred")
+    __slots__ = ("global_vec", "tags_pred", "category_l1_pred", "category_l2_pred", "category_l3_pred")
 
-    def __init__(self, global_vec, tags_pred, category_l1_pred):
+    def __init__(self, global_vec, tags_pred, category_l1_pred, category_l2_pred=0, category_l3_pred=0):
         self.global_vec = global_vec
         self.tags_pred = tags_pred
         self.category_l1_pred = category_l1_pred
+        self.category_l2_pred = category_l2_pred
+        self.category_l3_pred = category_l3_pred
 
 
 _infer_rr_counter = 0
@@ -458,6 +460,8 @@ async def _extract_features(deps, image_bytes: bytes):
         global_vec=data["global_vec"],
         tags_pred=data.get("tags_pred", []),
         category_l1_pred=data.get("category_l1_pred", 0),
+        category_l2_pred=data.get("category_l2_pred", 0),
+        category_l3_pred=data.get("category_l3_pred", 0),
     )
 
 

@@ -24,16 +24,20 @@ services:
     runtime: nvidia
     environment:
       NVIDIA_VISIBLE_DEVICES: all
+      CLIP_MODEL_PATH: /models/ViT-L-14.pt
+      FASHION_MODEL_PATH: /models/marqo-fashionsiglip
+    volumes:
+      - /data/imgsrch/models:/models:ro
     deploy:
       resources:
         limits:
-          memory: 8G
+          memory: 12G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8090/healthz"]
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 120s
+      start_period: 180s
 
   search-service:
     build: ./services/search-service

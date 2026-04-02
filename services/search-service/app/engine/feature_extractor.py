@@ -54,14 +54,15 @@ TENSORRT_ENGINE_PATH = MODEL_DIR / "backbone_fp16.engine"
 class FeatureResult:
     """特征提取结果 — 查询侧/写入侧通用"""
 
-    __slots__ = ("global_vec", "tags_pred", "category_l1_pred", "sub_vecs",
-                 "model_version", "embedding_dim")
+    __slots__ = ("global_vec", "tags_pred", "category_l1_pred", "category_l1_conf",
+                 "sub_vecs", "model_version", "embedding_dim")
 
     def __init__(
         self,
         global_vec: List[float],
         tags_pred: List[int],
         category_l1_pred: int,
+        category_l1_conf: float = 0.0,
         sub_vecs: Optional[List[List[float]]] = None,
         model_version: str = "unknown",
         embedding_dim: int = EMBEDDING_DIM,
@@ -69,6 +70,7 @@ class FeatureResult:
         self.global_vec = global_vec
         self.tags_pred = tags_pred
         self.category_l1_pred = category_l1_pred
+        self.category_l1_conf = category_l1_conf
         self.sub_vecs = sub_vecs
         self.model_version = model_version
         self.embedding_dim = embedding_dim
@@ -172,8 +174,9 @@ class FeatureExtractor:
             global_vec=data["global_vec"],
             tags_pred=data.get("tags_pred", []),
             category_l1_pred=data.get("category_l1_pred", 0),
+            category_l1_conf=data.get("category_l1_conf", 0.0),
             sub_vecs=None,
-            model_version="clip-vit-b-32-remote",
+            model_version=data.get("model_version", "vitl14-v2"),
             embedding_dim=len(data["global_vec"]),
         )
 
