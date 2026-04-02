@@ -1,0 +1,342 @@
+
+
+    <!DOCTYPE html>
+<!--[if IE 8]><html class="ie8"><![endif]-->
+<!--[if (gte IE 9)|!(IE)]>
+<html lang="en">
+<![endif]-->
+<head>
+    <meta charset="utf-8"/>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="keywords" content="JD.com,JD,JD Mall,JD Finance,JD Logistics,京东,京东商城,京东金融,京东物流,阿里巴巴,天猫,淘宝,Alibaba,e-commerce,ecommerce,China,logistics,supply chain,amazon,distribution,taobao,tmall,b2c,retail,omnichannel,trucking,truck drivers,career,tech,robotics,automation,drone,aliexpress,1688"/>
+    <meta name="description" content="JD.com is the largest retailer in China, a member of the NASDAQ100 and a Fortune Global 500 company."/>
+    <title>JD.com, Inc.</title>
+    <link rel="stylesheet" href="/static/css/bootstrap.css">
+    <link rel="stylesheet" href="/static/css/common.css">
+    <!-- home css -->
+    <link rel="stylesheet" href="/static/css/index.css">
+    <link rel="preconnect" href="https://use.typekit.net" crossorigin>
+    <link rel="preconnect" href="https://p.typekit.net" crossorigin>
+    <!-- Font -->
+    <script src="https://storage.360buyimg.com/static-hr/npm/jquery/1.11.3/dist/jquery.min.js"></script>
+    <script src="https://storage.360buyimg.com/static-hr/npm/bootstrap/3.3.5/dist/js/bootstrap.min.js"></script>
+    <!-- index js -->
+    <script src="/static/js/index.js"></script>
+    <!--[if lt IE 9]>
+    <script src="/static/js/respond.min.js"></script>
+    <![endif]-->
+    <!-- 埋点开始 -->
+    <script type="text/javascript">
+        window.jdpts={};jdpts._st=new Date().getTime();
+        var ctx = "";
+    </script>
+    <!-- 埋点结束 -->
+</head>
+
+<body data-spy="scroll" data-target=".menubar" data-offset="50">
+        <div style="
+        position: absolute;
+        z-index: -100;
+        pointer-events: none;
+        width: 99vw;
+        height: 99vh;
+        background-image: url('data:image/png;base64,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');
+      ">
+    <canvas width="300" height="300" style="display: none"></canvas>
+</div><!-- header -->
+        <div class="top-banner">
+    <a href="//www.jd.com/?country=USA" class="top-banner-link">Visit JD.com's main site.</a>
+</div>
+<!--  /widget/header/header.vm -->
+<div class="container">
+    <div class="headerbar clearfix">
+        <div class="logo">
+                            <a href="//www.jd.com/?country=USA" class="logo-img"><img style="width: 270px; height: 57px; object-fit: cover;" src="/static/images/main-logo-new.jpg" alt="JD.com"></a>
+                        <span class="logo-capt  hidden-xs">Authentic Products
+            <br>Delivered Today</span>
+        </div>
+    </div>
+</div>
+<!-- nav -->
+<div class="navigation">
+    <div class="container">
+        <div class="row">
+            <div class="navbar-header"><span class="navbar-toggle collapsed" data-toggle="collapse" data-target="#bs-navbar" aria-controls="bs-navbar" aria-expanded="false"><span class="sr-only">Toggle navigation</span><span class="icon-bar"></span><span class="icon-bar"></span><span class="icon-bar"></span>
+                <i class="fa remove"></i>
+                    </span>
+            </div>
+            <div class="navbar-collapse collapse" aria-expanded="false" id="bs-navbar">
+                <ul class="menu navbar-nav">
+                    <li class="home"><a class=" active " href="//corporate.jd.com/"><h1 style="font-weight: 500;">HOME</h1></a>
+                    </li>
+                    <li class="dropdown"><a href="#" class="dropdown-toggle " id="dropdownMenu1" data-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false"><h1 style="font-weight: 500;">ABOUT US</h1> <i class="glyphicon glyphicon-menu-down"></i></a>
+                        <div class="dropdown-menu" aria-labelledby="dropdownMenu1">
+                            <ul>
+                                <li><a href="//corporate.jd.com/ourBusiness"><i>·</i>Our Business</a>
+                                </li>
+                                <li><a href="//corporate.jd.com/ourHistory"><i>·</i>Our History</a>
+                                </li>
+                                <li><a href="//corporate.jd.com/missionValues"><i>·</i>Mission & Values</a>
+                                </li>
+                            </ul>
+                        </div>
+                    </li>
+                    <li class="dropdown"><a href="https://jdcorporateblog.com/" role="button" ><h1 style="font-weight: 500;">NEWS</h1><i class="glyphicon glyphicon-menu-down"></i></a>
+                    </li>
+                    <li class="dropdown">
+                        <a
+                        class=""
+                        href="/forPartners"
+                        class="dropdown"
+                        role="button"
+                        ><h1 style="font-weight: 500;">FOR PARTNERS</h1>
+                        </a>
+                    </li>
+                    <li class="dropdown"><a href="#" class="dropdown-toggle " id="dropdownMenu4" data-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false"><h1 style="font-weight: 500;">FOR INVESTORS</h1><i class="glyphicon glyphicon-menu-down"></i></a>
+                        <div class="dropdown-menu" aria-labelledby="dropdownMenu4">
+                            <ul>
+                                <li><a href="//ir.jd.com/"><i>·</i>Investor Home</a>
+                                </li>
+                                <li><a href="//ir.jd.com/stock-quote"><i>·</i>Stock Information</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/stock-quote"><i>·</i>Stock Quote</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/stock-chart"><i>·</i>Stock Chart</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/historical-price-lookup"><i>·</i>Historical Price Lookup</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/investment-calculator"><i>·</i>Investment Calculator</a>
+                                </li>
+                                <li><a href="//ir.jd.com/news-releases"><i>·</i>Investor News</a>
+                                </li>
+                                <li><a href="//ir.jd.com/hkex-filings"><i>·</i>HKEX Filings</a>
+                                </li>
+                                <li><a href="//ir.jd.com/sec-filings"><i>·</i>Financial Information</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/sec-filings"><i>·</i>SEC Filings</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/quarterly-results"><i>·</i>Quarterly Results</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/annual-reports"><i>·</i>Annual Reports</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/analyst-coverage"><i>·</i>Analyst Coverage</a>
+                                </li>
+                                <li><a href="//ir.jd.com/upcoming-events"><i>·</i>Investor Events / Calendar</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/upcoming-events"><i>·</i>Event Calendar</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/presentations"><i>·</i>Webcasts & Presentations</a>
+                                </li>
+                                <li class="indent-menu"><a href="//ir.jd.com/annual-meeting"><i>·</i>Shareholder Meetings</a>
+                                </li>
+                                <li><a href="https://ir.jd.com/esgcsr"><i>·</i>ESG / Sustainability</a>
+                                </li>
+                                <li><a href="//ir.jd.com/corporate-governance/highlights"><i>·</i>Corporate Governance</a>
+                                </li>
+                                <li><a href="//ir.jd.com/management"><i>·</i>Management</a>
+                                </li>
+                                <li><a href="//ir.jd.com/board-of-directors"><i>·</i>Board of Directors</a>
+                            </ul>
+                        </div>
+                    </li>
+                    <li><a class="" href="/Career "><h1 style="font-weight: 500;">CAREER</h1></a>
+                    </li>
+                    <li><a href="//corporate.jd.com/contactUs" class=""><h1 style="font-weight: 500;">CONTACT US</h1></a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+<!--/ /widget/header/header.vm -->
+<!-- header -->
+
+<!--layout-->
+<!-- main -->
+<div class="container">
+    <div class="row">
+        <div class="col-md-9 col-sm-12 col-xs-12 carouse-wrap">
+            <div class="carouse-bg" >
+                <div class="carousel carouse-loading" id="carouse">
+                    <!-- Indicators -->
+                    <ol class="carousel-indicators">
+
+                    </ol>
+                    <!-- Wrapper for slides -->
+                    <div class="carousel-inner">
+
+                    </div>
+                    <!-- Controls -->
+                    <a class="carousel-prev" href="#carouse" role="button" data-slide="prev">
+                    </a>
+                    <a class="carousel-next" href="#carouse" role="button" data-slide="next">
+                    </a>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-sm-12 col-xs-12 sidebar" >
+            <div class="row">
+                <div class="stat merchants col-md-12 col-sm-6 col-xs-6">
+                    <div class="stat-logo"><i></i></div>
+                    <div class="stat-content">
+                        <div class="stat-content-txt">90%+</div>
+                        <p>Orders Placed Through Mobile</p>
+                    </div>
+                </div>
+                <div class="stat globe col-md-12 col-sm-6 col-xs-6">
+
+                    <div class="stat-logo "><i></i></div>
+                    <div class="stat-content">
+                        <div class="stat-content-txt">34m sqm</div>
+                        <p>GFA of warehouse network</p>
+                    </div>
+                </div>
+                <div class="stat delivery col-md-12 col-sm-6 col-xs-6">
+                    <div class="stat-logo "><i></i></div>
+                    <div class="stat-content">
+                        <div class="stat-content-txt">1,600+</div>
+                        <p>Warehouses</p>
+                    </div>
+                </div>
+                <div class="stat warehouse col-md-12 col-sm-6 col-xs-6">
+                    <div class="stat-logo "><i></i></div>
+                    <div class="stat-content">
+                        <div class="stat-content-txt">US$187.2b</div>
+                        <p>2025 Net Revenues</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- introduction -->
+    <div class="introduction">
+        <h2>Introduction to JD.com</h2>
+        <p>Positioned as a technology and services enterprise with supply chain at its core, JD.com's business has expanded across retail, technology, logistics, health, industrials, property development, and international business. Committed to the principles of customer first, innovation, dedication, ownership, gratitude, and integrity, the company's mission is to make lives better through technology, striving to be the most trusted company in the world.</p>
+    </div>
+    <!-- /introduction -->
+    <!-- news -->
+    <div class="news" id="home-news">
+        <h2><a href="https://jdcorporateblog.com/">News &amp; Announcements</a></h2>
+        <div class="news-mc"></div>
+    </div>
+    <!-- /news -->
+</div>
+
+
+<!-- footer -->
+        <!--  /widget/footer/footer.vm -->
+<script>
+    function getYear(){
+        $(document).ready(function() {
+            // 使用jQuery的ajax方法请求后端接口
+            $.ajax({
+                url: '/getCurrentYear', // 后端接口URL
+                type: 'GET', // 请求类型
+                dataType: 'json', // 返回的数据类型
+                success: function(data) {
+                    console.log(data)
+                    // 请求成功时，使用从接口获取的年份更新页面元素
+                    $('#current-year').text(data);
+                },
+                error: function(error) {
+                    // 请求失败时的处理
+                    console.error('Error fetching the current year:', error);
+                }
+            });
+        });
+    }
+    getYear();
+</script>
+<div class="footer-link">
+    <div class="container">
+        <div class="row">
+            <div class="col-md-6 col-sm-12 col-xs-12">
+                <div class="row">
+                    <div class="col-md-6 col-sm-6 col-xs-6 fore">
+                        <h4 class="footer-header">About Us</h4>
+                        <a href="//corporate.jd.com/ourBusiness">Our Business</a>
+                        <a href="//corporate.jd.com/ourHistory">Our History</a>
+                        <a href="//corporate.jd.com/missionValues">Mission &amp; Values</a>
+                        <br>
+                        <h4 class="footer-header"><a href="https://jdcorporateblog.com/" style="font-size: 14px" role="button">News</a></h4>
+                        <br>
+                    </div>
+                    <div class="col-md-6 col-sm-6 col-xs-6 fore">
+                        <h4 class="footer-header"><a href="/forPartners" style="font-size: 14px" role="button">For Partners</a></h4>
+                        <h4 class="footer-header">For Investors</h4>
+                        <a href="//ir.jd.com/">Investor Home</a>
+                        <a href="//ir.jd.com/stock-quote">Stock Information</a>
+                        <a href="//ir.jd.com/news-releases">Investor News</a>
+                        <a href="//ir.jd.com/hkex-filings">HKEX Filings</a>
+                        <a href="//ir.jd.com/sec-filings">Financial Information</a>
+                        <a href="//ir.jd.com/upcoming-events">Investor Events / Calendar</a>
+                        <a href="https://ir.jd.com/esgcsr">ESG / Sustainability</a>
+                        <a href="//ir.jd.com/corporate-governance/highlights">Corporate Governance</a>
+                        <a href="//ir.jd.com/management">Management</a>
+                        <a href="//ir.jd.com/board-of-directors">Board of Directors</a>
+                        <br>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6 col-sm-12 col-xs-12">
+
+                <div class="row">
+                    <div class="col-md-6 col-sm-6 col-xs-6 fore">
+                        <h4 class="footer-header">
+                            <a
+                                    href="/Career"
+                                    style="font-size: 14px"
+                                    role="button"
+                            >Career</a
+                            >
+                        </h4>
+                        <h4 class="footer-header">Contact Us</h4>
+                        <a href="//corporate.jd.com/contactUs">Contact Information</a>
+                        <a href="//corporate.jd.com/contactUs#mapContainer">Map &amp; JD address</a>
+                        <br>
+                    </div>
+                    <div class="col-md-6 col-sm-6 col-xs-6 fore footer-logo-container">
+                        <div class="footer-logo">
+                                                            <a href="//www.jd.com/?country=USA" class="fore1"></a>
+                                                        <a href="https://www.linkedin.com/company/jd.com/" class="fore5"></a>
+                            <a href="https://twitter.com/JD_Corporate" class="fore6"></a>
+                            <a href="https://www.facebook.com/jd.cominc/" class="fore2"></a>
+                            <a href="https://www.youtube.com/channel/UCj1O__aZW_05RdTCL8E3kUA" class="fore3"></a>
+                            <a href="https://www.instagram.com/jd_corporate/" class="fore4"></a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="footer">
+    <div class="container-fluid">
+        <span class="copyright">
+            © 2004-<span id="current-year">2017</span> JD.com, Inc. All Rights Reserved&nbsp;&nbsp;
+            <em>Design by<span  class="jdc-logo"/></em>
+        </span>
+        <span class="links"><i>&nbsp;&nbsp;|&nbsp;&nbsp;</i><a href="//corporate.jd.com/privacyPolicy">Privacy Policy</a>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="//corporate.jd.com/disclaimer">Disclaimer</a>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="/Career">Career</a></span></div>
+</div>
+
+<!--/ /widget/footer/footer.vm --><!-- footer -->
+<script src="/static/js/common.js" defer></script>
+
+<!-- 埋点开始-->
+<script type="text/javascript">
+    var jaq = jaq || [];
+    jaq.push(['account','JA2016_163492']);
+    jaq.push(['domain','corporate.jd.com']);
+    jaq.push(['topic','traffic-oth']); //topic
+    (function() {
+        var ja = document.createElement('script'); ja.type = 'text/javascript'; ja.async = true;
+        ja.src = ('https:' == document.location.protocol ? 'https://wlssl' : 'http://wl') + '.jd.com/joya.js';
+        var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(ja, s);
+    })();
+</script>
+<!-- 埋点结束-->
+</body>
+</html>
+
+
