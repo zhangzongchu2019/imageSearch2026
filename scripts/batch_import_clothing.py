@@ -63,7 +63,7 @@ MILVUS_BATCH_SIZE = 5000
 MERCHANT_ID_START = 10001
 MERCHANT_ID_END = 12999
 CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "/tmp/batch_import_checkpoint.json")
-TASK_LOG_DIR = os.getenv("TASK_LOG_DIR", "data/task_logs")
+TASK_LOG_DIR = os.getenv("TASK_LOG_DIR", "/data/imgsrch/task_logs")
 
 
 # ── Task Tracker — 记录每次运行的详细信息 ──────────────────────────────────
