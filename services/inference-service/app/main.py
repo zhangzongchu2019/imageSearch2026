@@ -94,6 +94,7 @@ _fashion_dim: int = 0
 
 VITL14_MODEL_PATH = "/models/ViT-L-14.pt"
 FASHION_MODEL_PATH = "/models/marqo-fashionsiglip"
+FASHION_TOKENIZER_PATH = "/models/vit-b-16-siglip-tokenize"
 
 
 def _encode_text_features(tokenizer, model, prompts_dict, device, multi_prompt=True):
@@ -239,22 +240,23 @@ def _load_fashion_siglip():
     global _fashion_l3_features, _fashion_l3_names, _fashion_l3_codes
 
     model_path = os.environ.get("FASHION_MODEL_PATH", FASHION_MODEL_PATH)
+    tokenizer_path = os.environ.get("FASHION_TOKENIZER_PATH", FASHION_TOKENIZER_PATH)
 
     try:
         import open_clip
-        # 尝试用 open_clip 加载 (Marqo FashionSigLIP 兼容 open_clip)
-        if os.path.isdir(model_path):
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                "hf-hub:Marqo/marqo-fashionSigLIP",
-                cache_dir=model_path,
-            )
-            tokenizer = open_clip.get_tokenizer("hf-hub:Marqo/marqo-fashionSigLIP")
-        else:
-            logger.info("Downloading FashionSigLIP from HuggingFace...")
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                "hf-hub:Marqo/marqo-fashionSigLIP",
-            )
-            tokenizer = open_clip.get_tokenizer("hf-hub:Marqo/marqo-fashionSigLIP")
+        from open_clip.tokenizer import HFTokenizer
+
+        # 离线加载: ViT-B-16-SigLIP 架构 + 本地权重 + 本地 tokenizer
+        _orig_torch_load = torch.load
+        torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
+
+        weights_file = os.path.join(model_path, "open_clip_pytorch_model.bin")
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            "ViT-B-16-SigLIP", pretrained=weights_file,
+        )
+        torch.load = _orig_torch_load
+
+        tokenizer = HFTokenizer(tokenizer_path, context_length=64, clean="canonicalize")
 
         model.eval()
         model = model.to(_device)
@@ -271,7 +273,7 @@ def _load_fashion_siglip():
         with torch.no_grad():
             test_feat = model.encode_text(test_tokens)
         _fashion_dim = test_feat.shape[-1]
-        logger.info("FashionSigLIP loaded, dim=%d", _fashion_dim)
+        logger.info("FashionSigLIP loaded (offline), dim=%d", _fashion_dim)
 
     except Exception as e:
         logger.warning("Failed to load FashionSigLIP: %s — fashion L2/L3 will use ViT-L-14 fallback", e)

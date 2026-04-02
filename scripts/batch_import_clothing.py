@@ -584,14 +584,20 @@ class CLIPFeatureExtractor:
         """尝试加载 FashionSigLIP"""
         T = self._taxonomy
         try:
+            from open_clip.tokenizer import HFTokenizer
             fashion_path = os.environ.get("FASHION_MODEL_PATH", "/data/imgsrch/models/marqo-fashionsiglip")
+            tokenizer_path = os.environ.get("FASHION_TOKENIZER_PATH", "/data/imgsrch/models/vit-b-16-siglip-tokenize")
+            weights_file = os.path.join(fashion_path, "open_clip_pytorch_model.bin")
+
+            _orig = torch.load
+            torch.load = lambda *a, **kw: _orig(*a, **{**kw, "weights_only": False})
             self.fashion_model, _, self.fashion_preprocess = open_clip.create_model_and_transforms(
-                "hf-hub:Marqo/marqo-fashionSigLIP",
-                cache_dir=fashion_path if os.path.isdir(fashion_path) else None,
+                "ViT-B-16-SigLIP", pretrained=weights_file,
             )
-            self.fashion_tokenizer = open_clip.get_tokenizer("hf-hub:Marqo/marqo-fashionSigLIP")
+            torch.load = _orig
+            self.fashion_tokenizer = HFTokenizer(tokenizer_path, context_length=64, clean="canonicalize")
             self.fashion_model.eval().to(self.device)
-            log.info("FashionSigLIP loaded")
+            log.info("FashionSigLIP loaded (offline)")
 
             # 时尚 L2/L3 文本特征
             self.fashion_l2_features = {}

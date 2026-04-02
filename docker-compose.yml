@@ -26,6 +26,7 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       CLIP_MODEL_PATH: /models/ViT-L-14.pt
       FASHION_MODEL_PATH: /models/marqo-fashionsiglip
+      FASHION_TOKENIZER_PATH: /models/vit-b-16-siglip-tokenize
     volumes:
       - /data/imgsrch/models:/models:ro
     deploy:
