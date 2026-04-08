@@ -1,0 +1,81 @@
+# ============================================================
+# Pipeline Monitor — Deployment
+# 端口: 9800
+# NodePort: 52320
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-monitor-config
+  namespace: imgsrch-monitor
+  labels:
+    app: pipeline-monitor
+data:
+  PG_DSN: postgresql://imgsrch:imgsrch_pass@postgres.imgsrch-infra.svc.cluster.local:5432/image_search
+  REDIS_URL: redis://redis.imgsrch-infra.svc.cluster.local:6379/0
+  MILVUS_HOST: milvus-proxy.imgsrch-infra.svc.cluster.local
+  MILVUS_PORT: "19530"
+  PROMETHEUS_URL: http://prometheus.imgsrch-monitor.svc.cluster.local:9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pipeline-monitor
+  namespace: imgsrch-monitor
+  labels:
+    app: pipeline-monitor
+spec:
+  type: NodePort
+  ports:
+    - port: 9800
+      targetPort: 9800
+      nodePort: 52320
+      name: http
+  selector:
+    app: pipeline-monitor
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-monitor
+  namespace: imgsrch-monitor
+  labels:
+    app: pipeline-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pipeline-monitor
+  template:
+    metadata:
+      labels:
+        app: pipeline-monitor
+    spec:
+      containers:
+        - name: pipeline-monitor
+          image: imgsrch/pipeline-monitor:latest
+          ports:
+            - containerPort: 9800
+              name: http
+          envFrom:
+            - configMapRef:
+                name: pipeline-monitor-config
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: "250m"
+            limits:
+              memory: 512Mi
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9800
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9800
+            initialDelaySeconds: 5
+            periodSeconds: 10

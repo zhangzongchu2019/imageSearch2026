@@ -53,7 +53,7 @@ services:
       resources:
         limits:
           cpus: "32"
-          memory: 64G
+          memory: 256G
         reservations:
           cpus: "8"
           memory: 16G

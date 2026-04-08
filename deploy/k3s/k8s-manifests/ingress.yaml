@@ -1,0 +1,189 @@
+# ============================================================
+# Ingress 规则 — 统一入口
+# 使用 K3s 内置 Traefik 或替换后的 Ingress Controller
+#
+# 路由规则 (Ingress 走 ClusterIP port，NodePort 为宿主机直连):
+#   /api/search/*  -> search-service:8080     (NodePort: 52210)
+#   /api/write/*   -> write-service:8081      (NodePort: 52220)
+#   /api/cron/*    -> cron-scheduler:8082     (NodePort: 52230)
+#   /api/infer/*   -> inference-service:8090  (NodePort: 52200)
+#   /console/*     -> web-console:3000        (NodePort: 52250)
+#   /grafana/*     -> grafana:3000            (NodePort: 52310)
+#   /monitor/*     -> pipeline-monitor:9800   (NodePort: 52320)
+#   /prometheus/*  -> prometheus:9090         (NodePort: 52300)
+# ============================================================
+
+# ── 业务 API Ingress ──
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: imgsrch-api
+  namespace: imgsrch-app
+  labels:
+    app: imgsrch
+  annotations:
+    # 超时设置 (推理服务可能较慢)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # 请求体大小 (图片上传)
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    # 限流
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+spec:
+  rules:
+    # ── 业务域名路由 ──
+    - host: search.imagesearchsystemv3.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: search-service
+                port:
+                  number: 8080
+    - host: write.imagesearchsystemv3.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: write-service
+                port:
+                  number: 8081
+    - host: inference.imagesearchsystemv3.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: inference-service
+                port:
+                  number: 8090
+    - host: console.imagesearchsystemv3.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-console
+                port:
+                  number: 3000
+    # ── 兼容路径路由 (无域名时 fallback) ──
+    - http:
+        paths:
+          - path: /api/search
+            pathType: Prefix
+            backend:
+              service:
+                name: search-service
+                port:
+                  number: 8080
+          - path: /api/write
+            pathType: Prefix
+            backend:
+              service:
+                name: write-service
+                port:
+                  number: 8081
+          - path: /api/cron
+            pathType: Prefix
+            backend:
+              service:
+                name: cron-scheduler
+                port:
+                  number: 8082
+          - path: /api/infer
+            pathType: Prefix
+            backend:
+              service:
+                name: inference-service
+                port:
+                  number: 8090
+          - path: /console
+            pathType: Prefix
+            backend:
+              service:
+                name: web-console
+                port:
+                  number: 3000
+---
+# ── 监控 Ingress (ops 子域名) ──
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: imgsrch-monitor
+  namespace: imgsrch-monitor
+  labels:
+    app: imgsrch
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  rules:
+    - host: grafana.ops.imagesearchsystemv3.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+    - host: monitor.ops.imagesearchsystemv3.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pipeline-monitor
+                port:
+                  number: 9800
+    - host: prometheus.ops.imagesearchsystemv3.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  number: 9090
+    - host: minio.ops.imagesearchsystemv3.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minio
+                port:
+                  number: 9001
+    # ── 兼容路径路由 ──
+    - http:
+        paths:
+          - path: /grafana
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+          - path: /monitor
+            pathType: Prefix
+            backend:
+              service:
+                name: pipeline-monitor
+                port:
+                  number: 9800
+          - path: /prometheus
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  number: 9090

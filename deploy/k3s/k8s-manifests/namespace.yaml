@@ -1,0 +1,29 @@
+# ============================================================
+# 命名空间定义 — 以图搜商品系统
+# imgsrch-infra:   基础设施 (DB, MQ, 存储, 向量引擎)
+# imgsrch-app:     业务服务 (推理, 搜索, 写入, 调度)
+# imgsrch-monitor: 监控系统 (Prometheus, Grafana)
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: imgsrch-infra
+  labels:
+    project: imgsrch
+    tier: infrastructure
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: imgsrch-app
+  labels:
+    project: imgsrch
+    tier: application
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: imgsrch-monitor
+  labels:
+    project: imgsrch
+    tier: monitoring

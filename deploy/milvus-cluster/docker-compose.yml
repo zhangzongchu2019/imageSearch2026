@@ -1,0 +1,188 @@
+# ============================================================
+# Milvus v2.5.4 分布式集群 — 单机多组件部署
+# 复用已有基础设施: etcd 3节点, MinIO, Kafka (sandbox_default 网络)
+# ============================================================
+version: "3.9"
+
+x-milvus-common: &milvus-common
+  image: milvusdb/milvus:v2.5.4
+  restart: unless-stopped
+  networks:
+    - sandbox_default
+  environment: &milvus-env
+    ETCD_ENDPOINTS: etcd-node-1:2379,etcd-node-2:2379,etcd-node-3:2379
+    MINIO_ADDRESS: imgsrch-milvus-minio:9000
+    MINIO_ACCESS_KEY: minioadmin
+    MINIO_SECRET_KEY: minioadmin
+    MINIO_BUCKET_NAME: a-bucket
+    KAFKA_BROKER_LIST: kafka:29092
+  volumes:
+    - ./milvus.yaml:/milvus/configs/milvus.yaml:ro
+
+services:
+
+  # ── Coordinators ──
+
+  milvus-rootcoord:
+    <<: *milvus-common
+    container_name: milvus-rootcoord
+    command: ["milvus", "run", "rootcoord"]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  milvus-datacoord:
+    <<: *milvus-common
+    container_name: milvus-datacoord
+    command: ["milvus", "run", "datacoord"]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  milvus-querycoord:
+    <<: *milvus-common
+    container_name: milvus-querycoord
+    command: ["milvus", "run", "querycoord"]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  milvus-indexcoord:
+    <<: *milvus-common
+    container_name: milvus-indexcoord
+    command: ["milvus", "run", "indexcoord"]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ── Data Nodes (2 instances) ──
+
+  milvus-datanode-1:
+    <<: *milvus-common
+    container_name: milvus-datanode-1
+    command: ["milvus", "run", "datanode"]
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+    depends_on:
+      - milvus-datacoord
+
+  milvus-datanode-2:
+    <<: *milvus-common
+    container_name: milvus-datanode-2
+    command: ["milvus", "run", "datanode"]
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+    depends_on:
+      - milvus-datacoord
+
+  # ── Query Nodes (3 instances, 高内存用于加载向量) ──
+
+  milvus-querynode-1:
+    <<: *milvus-common
+    container_name: milvus-querynode-1
+    command: ["milvus", "run", "querynode"]
+    deploy:
+      resources:
+        limits:
+          memory: 128G
+    depends_on:
+      - milvus-querycoord
+
+  milvus-querynode-2:
+    <<: *milvus-common
+    container_name: milvus-querynode-2
+    command: ["milvus", "run", "querynode"]
+    deploy:
+      resources:
+        limits:
+          memory: 128G
+    depends_on:
+      - milvus-querycoord
+
+  milvus-querynode-3:
+    <<: *milvus-common
+    container_name: milvus-querynode-3
+    command: ["milvus", "run", "querynode"]
+    deploy:
+      resources:
+        limits:
+          memory: 128G
+    depends_on:
+      - milvus-querycoord
+
+  # ── Index Nodes (4 instances, 并行构建索引) ──
+
+  milvus-indexnode-1:
+    <<: *milvus-common
+    container_name: milvus-indexnode-1
+    command: ["milvus", "run", "indexnode"]
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+    depends_on:
+      - milvus-indexcoord
+
+  milvus-indexnode-2:
+    <<: *milvus-common
+    container_name: milvus-indexnode-2
+    command: ["milvus", "run", "indexnode"]
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+    depends_on:
+      - milvus-indexcoord
+
+  milvus-indexnode-3:
+    <<: *milvus-common
+    container_name: milvus-indexnode-3
+    command: ["milvus", "run", "indexnode"]
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+    depends_on:
+      - milvus-indexcoord
+
+  milvus-indexnode-4:
+    <<: *milvus-common
+    container_name: milvus-indexnode-4
+    command: ["milvus", "run", "indexnode"]
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+    depends_on:
+      - milvus-indexcoord
+
+  # ── Proxy (客户端入口) ──
+
+  milvus-proxy:
+    <<: *milvus-common
+    container_name: milvus-proxy
+    command: ["milvus", "run", "proxy"]
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    depends_on:
+      - milvus-rootcoord
+      - milvus-datacoord
+      - milvus-querycoord
+      - milvus-indexcoord
+
+networks:
+  sandbox_default:
+    external: true

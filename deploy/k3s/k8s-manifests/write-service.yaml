@@ -1,0 +1,126 @@
+# ============================================================
+# Write Service — Deployment + HPA (2-3 replicas)
+# 端口: 8081
+# NodePort: 52220
+# 依赖: PostgreSQL, Redis, Kafka, inference-service
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: write-service-config
+  namespace: imgsrch-app
+  labels:
+    app: write-service
+data:
+  IMGSRCH_ENV: production
+  REDIS_URL: redis://redis.imgsrch-infra.svc.cluster.local:6379/0
+  KAFKA_BROKERS: kafka.imgsrch-infra.svc.cluster.local:9092
+  MILVUS_HOST: milvus-proxy.imgsrch-infra.svc.cluster.local
+  INFERENCE_SERVICE_URL: http://inference-service.imgsrch-app.svc.cluster.local:8090
+  INFERENCE_SERVICE_URLS: http://inference-service.imgsrch-app.svc.cluster.local:8090
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: write-service-secret
+  namespace: imgsrch-app
+  labels:
+    app: write-service
+type: Opaque
+stringData:
+  PG_DSN: postgresql://imgsrch:imgsrch_pass@postgres.imgsrch-infra.svc.cluster.local:5432/image_search
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: write-service
+  namespace: imgsrch-app
+  labels:
+    app: write-service
+spec:
+  type: NodePort
+  ports:
+    - port: 8081
+      targetPort: 8081
+      nodePort: 52220
+      name: http
+  selector:
+    app: write-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: write-service
+  namespace: imgsrch-app
+  labels:
+    app: write-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: write-service
+  template:
+    metadata:
+      labels:
+        app: write-service
+    spec:
+      containers:
+        - name: write-service
+          image: imgsrch/write-service:latest
+          ports:
+            - containerPort: 8081
+              name: http
+          envFrom:
+            - configMapRef:
+                name: write-service-config
+            - secretRef:
+                name: write-service-secret
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "1"
+            limits:
+              memory: 4Gi
+              cpu: "2"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+---
+# HPA: 2-3 replicas
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: write-service-hpa
+  namespace: imgsrch-app
+  labels:
+    app: write-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: write-service
+  minReplicas: 2
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300

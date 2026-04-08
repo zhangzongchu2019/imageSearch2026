@@ -1,0 +1,115 @@
+# ============================================================
+# Bitmap Filter Service (Java/gRPC) — StatefulSet (RocksDB 有状态)
+# 端口: 50051 (gRPC)
+# NodePort: 52240
+# 存储: 100Gi (RocksDB)
+# 依赖: Kafka (CDC 消费)
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bitmap-filter-config
+  namespace: imgsrch-app
+  labels:
+    app: bitmap-filter
+data:
+  GRPC_PORT: "50051"
+  ROCKSDB_PATH: /data/rocksdb
+  ROCKSDB_CACHE_GB: "4"
+  CDC_TOPIC: dbserver.public.image_merchant_bitmaps
+  KAFKA_BROKERS: kafka.imgsrch-infra.svc.cluster.local:9092
+  PG_DSN: postgresql://imgsrch:imgsrch_pass@postgres.imgsrch-infra.svc.cluster.local:5432/image_search
+  REDIS_URL: redis://redis.imgsrch-infra.svc.cluster.local:6379/0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bitmap-filter
+  namespace: imgsrch-app
+  labels:
+    app: bitmap-filter
+spec:
+  type: NodePort
+  ports:
+    - port: 50051
+      targetPort: 50051
+      nodePort: 52240
+      name: grpc
+  selector:
+    app: bitmap-filter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bitmap-filter-headless
+  namespace: imgsrch-app
+  labels:
+    app: bitmap-filter
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: bitmap-filter
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bitmap-filter
+  namespace: imgsrch-app
+  labels:
+    app: bitmap-filter
+spec:
+  serviceName: bitmap-filter-headless
+  replicas: 2
+  selector:
+    matchLabels:
+      app: bitmap-filter
+  template:
+    metadata:
+      labels:
+        app: bitmap-filter
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: bitmap-filter
+          image: imgsrch/bitmap-filter-service:latest
+          ports:
+            - containerPort: 50051
+              name: grpc
+          envFrom:
+            - configMapRef:
+                name: bitmap-filter-config
+          resources:
+            requests:
+              memory: 8Gi
+              cpu: "2"
+            limits:
+              memory: 16Gi
+              cpu: "4"
+          volumeMounts:
+            - name: rocksdb-data
+              mountPath: /data/rocksdb
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: rocksdb-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi

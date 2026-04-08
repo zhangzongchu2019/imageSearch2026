@@ -267,6 +267,11 @@ services:
       MINIO_ADDRESS: minio:9000
     volumes:
       - milvus-data:/var/lib/milvus
+      - ./deploy/milvus/milvus.yaml:/milvus/configs/milvus.yaml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 64G
     depends_on:
       - etcd
       - minio
@@ -276,9 +281,22 @@ services:
     environment:
       ETCD_AUTO_COMPACTION_RETENTION: "1"
       ETCD_QUOTA_BACKEND_BYTES: "4294967296"
-    command: etcd --advertise-client-urls=http://etcd:2379 --listen-client-urls=http://0.0.0.0:2379
+      # 增大心跳/选举超时, 容忍 Milvus 高负载时的延迟
+      ETCD_HEARTBEAT_INTERVAL: "500"
+      ETCD_ELECTION_TIMEOUT: "5000"
+      ETCD_MAX_REQUEST_BYTES: "10485760"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >
+      etcd
+      --advertise-client-urls=http://etcd:2379
+      --listen-client-urls=http://0.0.0.0:2379
+      --max-txn-ops=25000
     volumes:
       - etcd-data:/etcd
+    deploy:
+      resources:
+        limits:
+          memory: 4G
 
   minio:
     image: minio/minio:latest

@@ -1,0 +1,125 @@
+# ============================================================
+# MinIO — StatefulSet, 4 replicas (Erasure Code)
+# 端口: 9000 (API), 9001 (Console)
+# NodePort: 52000 (API), 52001 (Console)
+# 存储: 500Gi per replica
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-secret
+  namespace: imgsrch-infra
+  labels:
+    app: minio
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: minioadmin
+  MINIO_ROOT_PASSWORD: minioadmin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: imgsrch-infra
+  labels:
+    app: minio
+spec:
+  type: NodePort
+  ports:
+    - port: 9000
+      targetPort: 9000
+      nodePort: 52000
+      name: api
+    - port: 9001
+      targetPort: 9001
+      nodePort: 52001
+      name: console
+  selector:
+    app: minio
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-headless
+  namespace: imgsrch-infra
+  labels:
+    app: minio
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 9000
+      targetPort: 9000
+      name: api
+  selector:
+    app: minio
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: imgsrch-infra
+  labels:
+    app: minio
+spec:
+  serviceName: minio-headless
+  replicas: 4
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          args:
+            - server
+            # 4 节点 Erasure Code: 每个节点 1 个磁盘
+            - http://minio-{0...3}.minio-headless.imgsrch-infra.svc.cluster.local/data
+            - --console-address
+            - ":9001"
+          envFrom:
+            - secretRef:
+                name: minio-secret
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "500m"
+            limits:
+              memory: 4Gi
+              cpu: "2"
+          volumeMounts:
+            - name: minio-data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: minio-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 500Gi

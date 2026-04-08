@@ -1,0 +1,164 @@
+# ============================================================
+# Kafka 7.6 (KRaft 模式) — StatefulSet, 3 replicas
+# 端口: 9092 (内部), 29092 (外部)
+# NodePort: 52040 (内部 9092)
+# 存储: 200Gi per replica
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: imgsrch-infra
+  labels:
+    app: kafka
+data:
+  # KRaft 集群 ID (固定值, 保证集群一致性)
+  CLUSTER_ID: "kCBSfKTLQhqL7JrLTEfoHA"
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_NUM_PARTITIONS: "6"
+  KAFKA_LOG_RETENTION_HOURS: "168"
+  KAFKA_LOG_SEGMENT_BYTES: "1073741824"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: imgsrch-infra
+  labels:
+    app: kafka
+spec:
+  type: NodePort
+  ports:
+    - port: 9092
+      targetPort: 9092
+      nodePort: 52040
+      name: internal
+    - port: 29092
+      targetPort: 29092
+      name: external
+  selector:
+    app: kafka
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  namespace: imgsrch-infra
+  labels:
+    app: kafka
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 9092
+      targetPort: 9092
+      name: internal
+    - port: 29093
+      targetPort: 29093
+      name: controller
+  selector:
+    app: kafka
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: imgsrch-infra
+  labels:
+    app: kafka
+spec:
+  serviceName: kafka-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: kafka
+          image: confluentinc/cp-kafka:7.6.0
+          ports:
+            - containerPort: 9092
+              name: internal
+            - containerPort: 29092
+              name: external
+            - containerPort: 29093
+              name: controller
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # 从 POD_NAME 中提取 node ID (kafka-0 -> 0, kafka-1 -> 1, ...)
+            - name: KAFKA_NODE_ID
+              value: "$(POD_NAME##*-)"
+            - name: CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: CLUSTER_ID
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "0@kafka-0.kafka-headless.imgsrch-infra.svc.cluster.local:29093,1@kafka-1.kafka-headless.imgsrch-infra.svc.cluster.local:29093,2@kafka-2.kafka-headless.imgsrch-infra.svc.cluster.local:29093"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:29092"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://$(POD_NAME).kafka-headless.imgsrch-infra.svc.cluster.local:9092,EXTERNAL://$(POD_NAME).kafka-headless.imgsrch-infra.svc.cluster.local:29092"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+          envFrom:
+            - configMapRef:
+                name: kafka-config
+          command:
+            - bash
+            - -c
+            - |
+              # 从 Pod 名称提取 node ID
+              export KAFKA_NODE_ID=${HOSTNAME##*-}
+              # 设置 advertised listeners (使用实际 Pod 名)
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.kafka-headless.imgsrch-infra.svc.cluster.local:9092,EXTERNAL://${HOSTNAME}.kafka-headless.imgsrch-infra.svc.cluster.local:29092"
+              # 格式化存储目录
+              /etc/confluent/docker/run
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "1"
+            limits:
+              memory: 4Gi
+              cpu: "4"
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /var/lib/kafka/data
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: kafka-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 200Gi

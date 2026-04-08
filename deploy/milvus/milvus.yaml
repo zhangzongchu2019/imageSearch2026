@@ -1,0 +1,63 @@
+# Milvus v2.5.4 production config
+# 针对 4×4090D / 2TB RAM / 大批量写入 优化
+
+etcd:
+  use:
+    embed: false
+  endpoints: etcd:2379
+  rootPath: by-dev
+  # 增大 etcd 请求超时 (默认 10s → 60s), 避免大量写入时 etcd 超时
+  requestTimeout: 60000  # ms
+
+minio:
+  address: minio
+  port: 9000
+  accessKeyID: minioadmin
+  secretAccessKey: minioadmin
+  bucketName: milvus-bucket
+
+# ── DataCoord: segment 管理 ──
+dataCoord:
+  segment:
+    # 增大 segment 最大行数 (默认 ~100万 → 200万), 减少 segment 数量
+    maxSize: 2048           # MB (默认 1024)
+    sealProportion: 0.25    # 25% 满就 seal (默认 0.25)
+  compaction:
+    enableAutoCompaction: true
+
+# ── DataNode: 写入缓冲 ──
+dataNode:
+  segment:
+    # 增大 flush 前缓冲大小, 减少 flush 频率
+    insertBufSize: 67108864   # 64MB (默认 16MB)
+  flowgraph:
+    maxQueueLength: 16        # 默认 16
+
+# ── IndexNode: 索引构建 ──
+indexNode:
+  # 增加构建索引的并发 slot 数 (默认 1 → 4)
+  scheduler:
+    buildParallel: 4
+
+# ── IndexCoord: 索引调度 ──
+indexCoord:
+  # 索引构建完成检查间隔 (默认 1s → 10s), 减少 etcd 轮询频率
+  scheduler:
+    interval: 10000  # ms
+
+# ── Proxy: 客户端连接 ──
+proxy:
+  # 增大最大写入 batch (默认 ~64K → 128K)
+  maxInsertSize: 134217728  # 128MB
+  maxTaskNum: 1024          # 默认 1024
+
+# ── QueryNode: 搜索性能 ──
+queryNode:
+  gracefulStopTimeout: 30   # 秒
+
+# ── Common: 通用 ──
+common:
+  gracefulStopTimeout: 120  # 秒 (默认 30)
+  # 增大 session TTL, 避免 etcd 慢时误判 session 过期
+  sessionTTL: 60            # 秒 (默认 30)
+  sessionRetryTimes: 10     # 默认 30, 但每次重试间隔也要考虑

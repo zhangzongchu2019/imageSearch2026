@@ -1,0 +1,428 @@
+# ============================================================
+# Milvus v2.5.4 分布式集群 — K8s 部署
+# 组件: rootcoord, datacoord, querycoord, indexcoord,
+#        proxy, datanode(2), querynode(3), indexnode(4)
+# 依赖: milvus-etcd (imgsrch-infra), minio (imgsrch-infra)
+# NodePort: 52100 (Proxy gRPC), 52101 (metrics)
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milvus-config
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+data:
+  milvus.yaml: |
+    # Milvus v2.5.4 production config — K8s 版
+    etcd:
+      use:
+        embed: false
+      endpoints: milvus-etcd-0.milvus-etcd-headless.imgsrch-infra.svc.cluster.local:2379,milvus-etcd-1.milvus-etcd-headless.imgsrch-infra.svc.cluster.local:2379,milvus-etcd-2.milvus-etcd-headless.imgsrch-infra.svc.cluster.local:2379
+      rootPath: by-dev
+      requestTimeout: 60000
+
+    minio:
+      address: minio.imgsrch-infra.svc.cluster.local
+      port: 9000
+      accessKeyID: minioadmin
+      secretAccessKey: minioadmin
+      bucketName: milvus-bucket
+
+    dataCoord:
+      segment:
+        maxSize: 2048
+        sealProportion: 0.25
+      compaction:
+        enableAutoCompaction: true
+
+    dataNode:
+      segment:
+        insertBufSize: 67108864
+      flowgraph:
+        maxQueueLength: 16
+
+    indexNode:
+      scheduler:
+        buildParallel: 4
+
+    indexCoord:
+      scheduler:
+        interval: 10000
+
+    proxy:
+      maxInsertSize: 134217728
+      maxTaskNum: 1024
+
+    queryNode:
+      gracefulStopTimeout: 30
+
+    common:
+      gracefulStopTimeout: 120
+      sessionTTL: 60
+      sessionRetryTimes: 10
+---
+# ── Milvus Proxy Service (客户端入口) ──
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-proxy
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: proxy
+spec:
+  type: NodePort
+  ports:
+    - port: 19530
+      targetPort: 19530
+      nodePort: 52100
+      name: grpc
+    - port: 9091
+      targetPort: 9091
+      nodePort: 52101
+      name: metrics
+  selector:
+    app: milvus
+    component: proxy
+---
+# ── Proxy Deployment ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-proxy
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: milvus
+      component: proxy
+  template:
+    metadata:
+      labels:
+        app: milvus
+        component: proxy
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.5.4
+          command: ["milvus", "run", "proxy"]
+          ports:
+            - containerPort: 19530
+            - containerPort: 9091
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "1"
+            limits:
+              memory: 4Gi
+              cpu: "4"
+          volumeMounts:
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+          livenessProbe:
+            tcpSocket:
+              port: 19530
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 19530
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: milvus-config
+          configMap:
+            name: milvus-config
+---
+# ── RootCoord Deployment ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-rootcoord
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: rootcoord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus
+      component: rootcoord
+  template:
+    metadata:
+      labels:
+        app: milvus
+        component: rootcoord
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.5.4
+          command: ["milvus", "run", "rootcoord"]
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "500m"
+            limits:
+              memory: 2Gi
+              cpu: "2"
+          volumeMounts:
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+      volumes:
+        - name: milvus-config
+          configMap:
+            name: milvus-config
+---
+# ── DataCoord Deployment ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-datacoord
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: datacoord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus
+      component: datacoord
+  template:
+    metadata:
+      labels:
+        app: milvus
+        component: datacoord
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.5.4
+          command: ["milvus", "run", "datacoord"]
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "500m"
+            limits:
+              memory: 2Gi
+              cpu: "2"
+          volumeMounts:
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+      volumes:
+        - name: milvus-config
+          configMap:
+            name: milvus-config
+---
+# ── QueryCoord Deployment ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-querycoord
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: querycoord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus
+      component: querycoord
+  template:
+    metadata:
+      labels:
+        app: milvus
+        component: querycoord
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.5.4
+          command: ["milvus", "run", "querycoord"]
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "500m"
+            limits:
+              memory: 2Gi
+              cpu: "2"
+          volumeMounts:
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+      volumes:
+        - name: milvus-config
+          configMap:
+            name: milvus-config
+---
+# ── IndexCoord Deployment ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-indexcoord
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: indexcoord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus
+      component: indexcoord
+  template:
+    metadata:
+      labels:
+        app: milvus
+        component: indexcoord
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.5.4
+          command: ["milvus", "run", "indexcoord"]
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "500m"
+            limits:
+              memory: 2Gi
+              cpu: "2"
+          volumeMounts:
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+      volumes:
+        - name: milvus-config
+          configMap:
+            name: milvus-config
+---
+# ── DataNode Deployment (2 replicas) ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-datanode
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: datanode
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: milvus
+      component: datanode
+  template:
+    metadata:
+      labels:
+        app: milvus
+        component: datanode
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.5.4
+          command: ["milvus", "run", "datanode"]
+          resources:
+            requests:
+              memory: 8Gi
+              cpu: "2"
+            limits:
+              memory: 32Gi
+              cpu: "8"
+          volumeMounts:
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+      volumes:
+        - name: milvus-config
+          configMap:
+            name: milvus-config
+---
+# ── QueryNode Deployment (3 replicas, 高内存) ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-querynode
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: querynode
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: milvus
+      component: querynode
+  template:
+    metadata:
+      labels:
+        app: milvus
+        component: querynode
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.5.4
+          command: ["milvus", "run", "querynode"]
+          resources:
+            requests:
+              memory: 32Gi
+              cpu: "4"
+            limits:
+              memory: 128Gi
+              cpu: "16"
+          volumeMounts:
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+      volumes:
+        - name: milvus-config
+          configMap:
+            name: milvus-config
+---
+# ── IndexNode Deployment (4 replicas, 并行构建索引) ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-indexnode
+  namespace: imgsrch-infra
+  labels:
+    app: milvus
+    component: indexnode
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: milvus
+      component: indexnode
+  template:
+    metadata:
+      labels:
+        app: milvus
+        component: indexnode
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.5.4
+          command: ["milvus", "run", "indexnode"]
+          resources:
+            requests:
+              memory: 8Gi
+              cpu: "2"
+            limits:
+              memory: 32Gi
+              cpu: "8"
+          volumeMounts:
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+      volumes:
+        - name: milvus-config
+          configMap:
+            name: milvus-config

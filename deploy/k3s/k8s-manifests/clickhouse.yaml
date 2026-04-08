@@ -1,0 +1,86 @@
+# ============================================================
+# ClickHouse 24.1 — StatefulSet
+# 端口: 8123 (HTTP), 9000 (Native)
+# NodePort: 52050 (HTTP), 52051 (Native/TCP)
+# 存储: 200Gi
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: imgsrch-infra
+  labels:
+    app: clickhouse
+spec:
+  type: NodePort
+  ports:
+    - port: 8123
+      targetPort: 8123
+      nodePort: 52050
+      name: http
+    - port: 9000
+      targetPort: 9000
+      nodePort: 52051
+      name: native
+  selector:
+    app: clickhouse
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: imgsrch-infra
+  labels:
+    app: clickhouse
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clickhouse
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.1
+          ports:
+            - containerPort: 8123
+              name: http
+            - containerPort: 9000
+              name: native
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "1"
+            limits:
+              memory: 8Gi
+              cpu: "4"
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: clickhouse-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 200Gi

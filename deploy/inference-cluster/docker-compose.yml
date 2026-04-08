@@ -1,0 +1,97 @@
+# ============================================================
+# 4-GPU 推理集群 — 每张 4090D 独立 inference 实例
+# Nginx 负载均衡统一入口 :8090
+# ============================================================
+version: "3.9"
+
+x-inference-common: &inference-common
+  build: ../../services/inference-service
+  ipc: host
+  runtime: nvidia
+  restart: unless-stopped
+  networks:
+    - sandbox_default
+  environment: &inference-env
+    CLIP_MODEL_PATH: /models/ViT-L-14.pt
+    FASHION_MODEL_PATH: /models/marqo-fashionsiglip
+    FASHION_TOKENIZER_PATH: /models/vit-b-16-siglip-tokenize
+    MILVUS_HOST: milvus-proxy
+  volumes:
+    - /data/imgsrch/models:/models:ro
+  deploy:
+    resources:
+      limits:
+        memory: 12G
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8090/healthz"]
+    interval: 30s
+    timeout: 5s
+    retries: 5
+    start_period: 180s
+
+services:
+
+  inference-gpu0:
+    <<: *inference-common
+    container_name: inference-gpu0
+    environment:
+      <<: *inference-env
+      NVIDIA_VISIBLE_DEVICES: "0"
+    ports:
+      - "8090:8090"
+
+  inference-gpu1:
+    <<: *inference-common
+    container_name: inference-gpu1
+    environment:
+      <<: *inference-env
+      NVIDIA_VISIBLE_DEVICES: "1"
+    ports:
+      - "8190:8090"
+
+  inference-gpu2:
+    <<: *inference-common
+    container_name: inference-gpu2
+    environment:
+      <<: *inference-env
+      NVIDIA_VISIBLE_DEVICES: "2"
+    ports:
+      - "8290:8090"
+
+  inference-gpu3:
+    <<: *inference-common
+    container_name: inference-gpu3
+    environment:
+      <<: *inference-env
+      NVIDIA_VISIBLE_DEVICES: "3"
+    ports:
+      - "8390:8090"
+
+  inference-lb:
+    image: nginx:1.25-alpine
+    container_name: inference-lb
+    restart: unless-stopped
+    ports:
+      - "8089:8090"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - sandbox_default
+    depends_on:
+      inference-gpu0:
+        condition: service_healthy
+      inference-gpu1:
+        condition: service_healthy
+      inference-gpu2:
+        condition: service_healthy
+      inference-gpu3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+networks:
+  sandbox_default:
+    external: true

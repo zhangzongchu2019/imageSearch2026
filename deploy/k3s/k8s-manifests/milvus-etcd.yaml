@@ -1,0 +1,153 @@
+# ============================================================
+# Milvus 专用 etcd 集群 — StatefulSet, 3 replicas
+# 端口: 2379 (client), 2380 (peer)
+# NodePort: 52010 (client)
+# 与 K3s 内置 etcd 分离，避免干扰
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milvus-etcd-config
+  namespace: imgsrch-infra
+  labels:
+    app: milvus-etcd
+data:
+  # etcd 调优参数 (参考现有 milvus.yaml 配置)
+  ETCD_AUTO_COMPACTION_RETENTION: "1"
+  ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+  ETCD_HEARTBEAT_INTERVAL: "500"
+  ETCD_ELECTION_TIMEOUT: "5000"
+  ETCD_MAX_REQUEST_BYTES: "10485760"
+  ETCD_SNAPSHOT_COUNT: "50000"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-etcd
+  namespace: imgsrch-infra
+  labels:
+    app: milvus-etcd
+spec:
+  type: NodePort
+  ports:
+    - port: 2379
+      targetPort: 2379
+      nodePort: 52010
+      name: client
+  selector:
+    app: milvus-etcd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-etcd-headless
+  namespace: imgsrch-infra
+  labels:
+    app: milvus-etcd
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 2379
+      targetPort: 2379
+      name: client
+    - port: 2380
+      targetPort: 2380
+      name: peer
+  selector:
+    app: milvus-etcd
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: milvus-etcd
+  namespace: imgsrch-infra
+  labels:
+    app: milvus-etcd
+spec:
+  serviceName: milvus-etcd-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: milvus-etcd
+  template:
+    metadata:
+      labels:
+        app: milvus-etcd
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.12
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          envFrom:
+            - configMapRef:
+                name: milvus-etcd-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ETCD_NAME
+              value: "$(POD_NAME)"
+            - name: ETCD_DATA_DIR
+              value: /etcd-data
+          command:
+            - /bin/sh
+            - -c
+            - |
+              PEERS="milvus-etcd-0=http://milvus-etcd-0.milvus-etcd-headless.imgsrch-infra.svc.cluster.local:2380"
+              PEERS="${PEERS},milvus-etcd-1=http://milvus-etcd-1.milvus-etcd-headless.imgsrch-infra.svc.cluster.local:2380"
+              PEERS="${PEERS},milvus-etcd-2=http://milvus-etcd-2.milvus-etcd-headless.imgsrch-infra.svc.cluster.local:2380"
+
+              exec etcd \
+                --name=${HOSTNAME} \
+                --data-dir=/etcd-data \
+                --listen-client-urls=http://0.0.0.0:2379 \
+                --listen-peer-urls=http://0.0.0.0:2380 \
+                --advertise-client-urls=http://${HOSTNAME}.milvus-etcd-headless.imgsrch-infra.svc.cluster.local:2379 \
+                --initial-advertise-peer-urls=http://${HOSTNAME}.milvus-etcd-headless.imgsrch-infra.svc.cluster.local:2380 \
+                --initial-cluster=${PEERS} \
+                --initial-cluster-token=milvus-etcd-cluster \
+                --initial-cluster-state=new \
+                --max-txn-ops=25000
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "500m"
+            limits:
+              memory: 4Gi
+              cpu: "2"
+          volumeMounts:
+            - name: etcd-data
+              mountPath: /etcd-data
+          livenessProbe:
+            exec:
+              command:
+                - etcdctl
+                - endpoint
+                - health
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - etcdctl
+                - endpoint
+                - health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: etcd-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

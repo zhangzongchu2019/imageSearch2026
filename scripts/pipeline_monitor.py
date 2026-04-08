@@ -32,7 +32,7 @@ app = FastAPI(title="Pipeline Monitor")
 
 DATA_ROOT = os.getenv("DATA_ROOT", "/data/imgsrch")
 STATE_FILE = f"{DATA_ROOT}/task_logs/pipeline_state.json"
-TOTAL_TARGET = 100_000_000  # 1 亿目标
+TOTAL_TARGET = 80_000_000  # 8000 万目标 (热区VIP/SVIP各2000万 + 冷区VIP/SVIP各2000万)
 
 
 # ── 数据采集 ──
@@ -68,10 +68,25 @@ def get_running_batch() -> dict | None:
 def get_db_stats() -> dict:
     stats = {"milvus": 0, "pg_dedup": 0, "pg_bitmap": 0, "pg_merchants": 0}
     try:
-        from pymilvus import connections, Collection
+        # 先用 socket 快速检测 Milvus 是否可达, 避免 pymilvus retry 卡住
+        import socket
+        _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _s.settimeout(2)
+        _s.connect(("localhost", 19530))
+        _s.close()
+    except Exception:
+        return stats
+    try:
+        from pymilvus import connections, Collection, utility
         connections.connect("default", host="localhost", port=19530, timeout=3)
-        coll = Collection("global_images_hot")
-        stats["milvus"] = coll.num_entities
+        total = 0
+        for name in utility.list_collections():
+            try:
+                c = Collection(name)
+                total += c.num_entities
+            except:
+                pass
+        stats["milvus"] = total
     except Exception as e:
         stats["milvus_error"] = str(e)[:80]
     try:
@@ -106,6 +121,12 @@ def get_system_stats() -> dict:
         stats["disk_used_gb"] = round(disk.used / (1024**3), 0)
         stats["disk_free_gb"] = round(disk.free / (1024**3), 0)
         stats["disk_pct"] = disk.percent
+        # 网络流量
+        net = psutil.net_io_counters()
+        stats["net_sent_gb"] = round(net.bytes_sent / (1024**3), 2)
+        stats["net_recv_gb"] = round(net.bytes_recv / (1024**3), 2)
+        stats["net_sent_bytes"] = net.bytes_sent
+        stats["net_recv_bytes"] = net.bytes_recv
     except ImportError:
         pass
     # GPU
@@ -229,7 +250,7 @@ def get_services_status() -> list:
         ("Redis",        6379,  "tcp",  "缓存"),
         ("Milvus",       19530, "tcp",  "向量数据库"),
         ("Kafka",        29092, "tcp",  "消息队列"),
-        ("etcd",         2379,  "tcp",  "Milvus 元数据"),
+        ("etcd",         2379,  "docker", "Milvus 元数据 (3节点集群)"),
         ("ClickHouse",   8123,  "tcp",  "分析型存储"),
         ("Prometheus",   9099,  "tcp",  "监控采集"),
         ("Grafana",      3002,  "tcp",  "监控面板"),
@@ -237,27 +258,48 @@ def get_services_status() -> list:
     for name, port, proto, desc in infra_checks:
         entry = {"name": name, "port": port, "lang": "infra", "desc": desc, "status": "down", "detail": ""}
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            if s.connect_ex(("localhost", port)) == 0:
-                entry["status"] = "up"
-            s.close()
+            if proto == "docker":
+                # etcd 3节点集群: 通过 docker 检查健康状态
+                import subprocess
+                r = subprocess.run(
+                    ["docker", "exec", "etcd-node-1", "etcdctl", "endpoint", "health",
+                     "--endpoints=etcd-node-1:2379,etcd-node-2:2379,etcd-node-3:2379"],
+                    capture_output=True, text=True, timeout=5)
+                healthy = r.stdout.count("is healthy")
+                if healthy > 0:
+                    entry["status"] = "up"
+                    entry["detail"] = f"{healthy}/3 nodes healthy"
+            else:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                if s.connect_ex(("localhost", port)) == 0:
+                    entry["status"] = "up"
+                s.close()
         except Exception:
             pass
         services.append(entry)
 
-    # ── 数据量补充 (Milvus 分区 / PG 表) ──
+    # ── 数据量补充 (Milvus 多 Collection) ──
     try:
-        from pymilvus import connections, Collection
+        import socket
+        _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _s.settimeout(2)
+        _s.connect(("localhost", 19530))
+        _s.close()
+        from pymilvus import connections, Collection, utility
         connections.connect("default", host="localhost", port=19530, timeout=3)
-        coll = Collection("global_images_hot")
-        partitions_info = []
-        for p in coll.partitions:
-            if p.num_entities > 0:
-                partitions_info.append(f"{p.name}={p.num_entities:,}")
+        coll_info = []
+        for name in utility.list_collections():
+            try:
+                c = Collection(name)
+                n = c.num_entities
+                if n > 0:
+                    coll_info.append(f"{name}={n:,}")
+            except:
+                pass
         for svc in services:
             if svc["name"] == "Milvus":
-                svc["detail"] = f"global_images_hot: {coll.num_entities:,} | " + ", ".join(partitions_info)
+                svc["detail"] = " | ".join(coll_info) if coll_info else "connected"
     except Exception:
         pass
 
@@ -307,18 +349,128 @@ def get_recent_log(batch_id: str = None, lines: int = 30) -> str:
         return f"(error: {e})"
 
 
+def get_task_progress() -> dict:
+    """从最新日志解析进度 (batch_import 或 derive)"""
+    # 找最新的日志文件 (batch_import, derive, 或 svip pipeline)
+    all_logs = glob.glob(f"{DATA_ROOT}/task_logs/batch_import_*.log") + \
+               glob.glob(f"{DATA_ROOT}/task_logs/derive_*.log") + \
+               glob.glob(f"{DATA_ROOT}/task_logs/svip_*.log")
+    if not all_logs:
+        return {}
+    logs = sorted(all_logs, key=os.path.getmtime)
+    log_path = logs[-1]
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            read_size = min(size, 32768)
+            f.seek(max(0, size - read_size))
+            content = f.read().decode("utf-8", errors="replace")
+        # 找最后一条 PROGRESS 行
+        progress = {}
+        for line in content.splitlines():
+            if "##PROGRESS##" in line:
+                try:
+                    payload = line.split("##PROGRESS##", 1)[1]
+                    progress = json.loads(payload)
+                except Exception:
+                    pass
+        # 如果没有 PROGRESS 行，尝试解析 derive 日志格式
+        if not progress and "derive" in log_path:
+            for line in content.splitlines():
+                if "Generated variants for" in line:
+                    m = re.search(r"(\d+)/(\d+) records \((\d+) variants", line)
+                    if m:
+                        done_src = int(m.group(1))
+                        total_src = int(m.group(2))
+                        n_variants = int(m.group(3))
+                        progress = {
+                            "stage": "derive",
+                            "completed": n_variants,
+                            "total": 19600044,
+                            "message": f"衍生中: {done_src:,}/{total_src:,} 源记录, {n_variants:,} 变体",
+                        }
+                elif "Milvus upsert" in line:
+                    m = re.search(r"(\d+)/(\d+)", line)
+                    if m:
+                        progress = {
+                            "stage": "derive_milvus",
+                            "completed": int(m.group(1)),
+                            "total": int(m.group(2)),
+                            "message": f"衍生写入 Milvus: {m.group(1)}/{m.group(2)}",
+                        }
+                elif "uri_dedup" in line and "/" in line:
+                    m = re.search(r"(\d+)/(\d+)", line)
+                    if m:
+                        progress = {
+                            "stage": "derive_pg",
+                            "completed": int(m.group(1)),
+                            "total": int(m.group(2)),
+                            "message": f"衍生写入 PG: {m.group(1)}/{m.group(2)}",
+                        }
+                elif "Batch" in line and "done" in line.lower():
+                    m = re.search(r"Total written: ([\d,]+)/([\d,]+)", line)
+                    if m:
+                        progress = {
+                            "stage": "derive",
+                            "completed": int(m.group(1).replace(",", "")),
+                            "total": int(m.group(2).replace(",", "")),
+                            "message": line.split("] ", 1)[-1] if "] " in line else line,
+                        }
+
+        # 补充下载文件数 (磁盘实际计数)
+        dl_dir = "/tmp/clothing_images"
+        if os.path.isdir(dl_dir):
+            try:
+                progress["files_on_disk"] = len(os.listdir(dl_dir))
+            except Exception:
+                pass
+        progress["log_file"] = os.path.basename(log_path)
+        return progress
+    except Exception:
+        return {}
+
+
+TASK_LIST_FILE = f"{DATA_ROOT}/task_logs/task_list.json"
+
+
+def get_task_list() -> list:
+    """读取任务清单"""
+    if os.path.exists(TASK_LIST_FILE):
+        try:
+            with open(TASK_LIST_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
 # ── API ──
 
 @app.get("/api/status")
 async def api_status():
+    import asyncio
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    _pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+    async def _safe(fn, default=None):
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(_pool, fn), timeout=8)
+        except Exception:
+            return default if default is not None else {}
+
     state = get_pipeline_state()
     running = get_running_batch()
-    db = get_db_stats()
-    sys_stats = get_system_stats()
-    history = get_batch_history()
-    services = get_services_status()
+    db = await _safe(get_db_stats, {"milvus": 0, "pg_dedup": 0, "pg_bitmap": 0})
+    sys_stats = await _safe(get_system_stats, {})
+    history = await _safe(get_batch_history, [])
+    services = await _safe(get_services_status, [])
+    task_progress = get_task_progress()
 
     progress_pct = db.get("milvus", 0) / TOTAL_TARGET * 100 if TOTAL_TARGET > 0 else 0
+
+    task_list = get_task_list()
 
     return {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -328,6 +480,8 @@ async def api_status():
         "system": sys_stats,
         "history": history,
         "services": services,
+        "task_progress": task_progress,
+        "task_list": task_list,
         "progress_pct": round(progress_pct, 2),
         "total_target": TOTAL_TARGET,
     }
@@ -405,6 +559,20 @@ h1 { font-size: 18px; color: #58a6ff; margin-bottom: 12px; }
 .history-table { width: 100%; font-size: 12px; }
 .history-table td { padding: 4px 6px; border-bottom: 1px solid #21262d; }
 
+.task-list { font-size: 12px; }
+.task-item { display: flex; align-items: center; padding: 6px 8px; border-bottom: 1px solid #21262d;
+             border-radius: 4px; margin-bottom: 2px; transition: background 0.3s; }
+.task-item:last-child { border: none; }
+.task-item.task-running { background: rgba(158, 217, 63, 0.12); border-left: 3px solid #9ed93f;
+                          animation: runGlow 2s ease-in-out infinite; }
+@keyframes runGlow { 0%,100% { background: rgba(158, 217, 63, 0.10); } 50% { background: rgba(158, 217, 63, 0.20); } }
+.task-num { width: 24px; color: #484f58; font-size: 11px; flex-shrink: 0; }
+.task-name { flex: 1; }
+.task-status { flex-shrink: 0; margin-left: 8px; }
+.task-eta { color: #484f58; font-size: 10px; margin-left: 6px; flex-shrink: 0; }
+.task-item.task-running .task-num { color: #9ed93f; font-weight: 600; }
+.task-item.task-running .task-eta { color: #9ed93f; }
+
 .refresh-info { text-align: center; font-size: 11px; color: #484f58; margin-top: 8px; }
 .timestamp { font-size: 11px; color: #484f58; float: right; }
 </style>
@@ -434,8 +602,14 @@ h1 { font-size: 18px; color: #58a6ff; margin-bottom: 12px; }
   </div>
   <div class="stat-row">
     <span class="stat-label">目标</span>
-    <span class="stat-value" id="v-target">100,000,000</span>
+    <span class="stat-value" id="v-target">80,000,000</span>
   </div>
+</div>
+
+<!-- 任务清单 -->
+<div class="card">
+  <h2>任务清单</h2>
+  <div class="task-list" id="task-list">加载中...</div>
 </div>
 
 <!-- 当前状态 -->
@@ -455,6 +629,35 @@ h1 { font-size: 18px; color: #58a6ff; margin-bottom: 12px; }
   </div>
 </div>
 
+<!-- 任务进度 -->
+<div class="card" id="card-task">
+  <h2>任务进度</h2>
+  <div class="stat-row">
+    <span class="stat-label">阶段</span>
+    <span class="stat-value blue" id="v-task-stage">-</span>
+  </div>
+  <div class="progress-bar">
+    <div class="progress-fill" id="task-pbar" style="width:0%;background:linear-gradient(90deg,#1f6feb,#58a6ff)"></div>
+    <div class="progress-text" id="task-ptext">-</div>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">已完成 / 总计</span>
+    <span class="stat-value" id="v-task-count">-</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">磁盘文件数</span>
+    <span class="stat-value" id="v-task-files">-</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">速率</span>
+    <span class="stat-value green" id="v-task-rate">-</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">日志</span>
+    <span class="stat-value" id="v-task-log" style="font-size:11px;color:#8b949e">-</span>
+  </div>
+</div>
+
 <!-- 系统资源 -->
 <div class="card">
   <h2>系统资源</h2>
@@ -469,6 +672,14 @@ h1 { font-size: 18px; color: #58a6ff; margin-bottom: 12px; }
   <div class="stat-row">
     <span class="stat-label">磁盘 /data</span>
     <span class="stat-value" id="v-disk">-</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">网络 ↑/↓</span>
+    <span class="stat-value" id="v-net">-</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">网络速率</span>
+    <span class="stat-value green" id="v-net-rate">-</span>
   </div>
   <div class="gpu-bar" id="gpu-bar"></div>
 </div>
@@ -495,7 +706,7 @@ h1 { font-size: 18px; color: #58a6ff; margin-bottom: 12px; }
   <div class="log-box" id="log-box">加载中...</div>
 </div>
 
-<div class="refresh-info">每 10 秒自动刷新</div>
+<div class="refresh-info">每 5 秒自动刷新</div>
 
 <script>
 function fmt(n) { return n ? n.toLocaleString() : '-'; }
@@ -543,6 +754,57 @@ async function refresh() {
       document.getElementById('v-running').textContent = '-';
     }
 
+    // task list
+    const tl = data.task_list || [];
+    if (tl.length) {
+      document.getElementById('task-list').innerHTML = tl.map(t => {
+        const isRunning = t.status === 'running';
+        const icon = t.status === 'done' ? '<span style="color:#3fb950">✓</span>'
+          : isRunning ? '<span style="color:#9ed93f;font-weight:700">▶</span>'
+          : t.status === 'failed' ? '<span style="color:#f85149">✗</span>'
+          : '<span style="color:#484f58">○</span>';
+        const nameStyle = t.status === 'done' ? 'color:#8b949e;text-decoration:line-through'
+          : isRunning ? 'color:#9ed93f;font-weight:600' : '';
+        const rowClass = isRunning ? 'task-item task-running' : 'task-item';
+        return '<div class="' + rowClass + '">' +
+          '<span class="task-num">' + t.id + '</span>' +
+          icon + ' ' +
+          '<span class="task-name" style="' + nameStyle + '">' + t.name + '</span>' +
+          '<span class="task-eta">' + (t.eta || '') + '</span>' +
+          '</div>';
+      }).join('');
+    }
+
+    // task progress
+    const tp = data.task_progress || {};
+    const stageNames = {download: '下载图片', inference: 'GPU推理', milvus: '写入Milvus', pg: '写入PG', collect: '收集URL', done: '完成'};
+    document.getElementById('v-task-stage').textContent = stageNames[tp.stage] || tp.stage || '-';
+    if (tp.total > 0) {
+      const tpPct = (tp.completed / tp.total * 100);
+      document.getElementById('task-pbar').style.width = Math.min(tpPct, 100) + '%';
+      document.getElementById('task-ptext').textContent = tpPct.toFixed(1) + '%';
+      document.getElementById('v-task-count').textContent = fmt(tp.completed) + ' / ' + fmt(tp.total);
+    } else {
+      document.getElementById('task-pbar').style.width = '0%';
+      document.getElementById('task-ptext').textContent = '-';
+      document.getElementById('v-task-count').textContent = '-';
+    }
+    document.getElementById('v-task-files').textContent = tp.files_on_disk ? fmt(tp.files_on_disk) : '-';
+    // 任务速率
+    if (window._lastTask && tp.completed > 0) {
+      const dt = 5;
+      const rate = (tp.completed - window._lastTask.completed) / dt;
+      if (rate > 0) {
+        const eta = (tp.total - tp.completed) / rate;
+        const etaMin = Math.floor(eta / 60);
+        const etaH = Math.floor(etaMin / 60);
+        const etaStr = etaH > 0 ? etaH + 'h' + (etaMin%60) + 'm' : etaMin + 'min';
+        document.getElementById('v-task-rate').textContent = rate.toFixed(1) + ' 张/s  ETA ' + etaStr;
+      }
+    }
+    window._lastTask = { completed: tp.completed || 0 };
+    document.getElementById('v-task-log').textContent = tp.log_file || '-';
+
     // system
     const sys = data.system || {};
     document.getElementById('v-cpu').textContent = (sys.cpu_pct || 0) + '%';
@@ -550,6 +812,18 @@ async function refresh() {
       (sys.mem_used_gb || 0) + ' / ' + (sys.mem_total_gb || 0) + ' GB (' + (sys.mem_pct || 0) + '%)';
     document.getElementById('v-disk').textContent =
       (sys.disk_used_gb || 0) + ' / ' + (sys.disk_total_gb || 0) + ' GB (空余 ' + (sys.disk_free_gb || 0) + 'GB)';
+    document.getElementById('v-net').textContent =
+      '↑ ' + (sys.net_sent_gb || 0) + ' GB  ↓ ' + (sys.net_recv_gb || 0) + ' GB';
+
+    // 网络速率计算
+    if (window._lastNet) {
+      const dt = 5; // 5 秒刷新
+      const sentRate = ((sys.net_sent_bytes || 0) - window._lastNet.sent) / dt;
+      const recvRate = ((sys.net_recv_bytes || 0) - window._lastNet.recv) / dt;
+      const fmtRate = (b) => b > 1048576 ? (b/1048576).toFixed(1) + ' MB/s' : (b/1024).toFixed(0) + ' KB/s';
+      document.getElementById('v-net-rate').textContent = '↑ ' + fmtRate(sentRate) + '  ↓ ' + fmtRate(recvRate);
+    }
+    window._lastNet = { sent: sys.net_sent_bytes || 0, recv: sys.net_recv_bytes || 0 };
 
     // GPU
     const gpuBar = document.getElementById('gpu-bar');
@@ -625,7 +899,7 @@ async function refresh() {
 }
 
 refresh();
-setInterval(refresh, 10000);
+setInterval(refresh, 5000);
 </script>
 </body>
 </html>"""

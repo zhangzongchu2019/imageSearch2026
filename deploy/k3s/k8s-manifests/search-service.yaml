@@ -1,0 +1,148 @@
+# ============================================================
+# Search Service — Deployment + HPA (3-5 replicas)
+# 端口: 8080
+# NodePort: 52210
+# 依赖: PostgreSQL, Redis, Milvus, Kafka, inference-service
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: search-service-config
+  namespace: imgsrch-app
+  labels:
+    app: search-service
+data:
+  IMGSRCH_ENV: production
+  IMGSRCH_SERVER__WORKERS: "4"
+  IMGSRCH_REDIS__HOST: redis.imgsrch-infra.svc.cluster.local
+  IMGSRCH_POSTGRES__HOST: postgres.imgsrch-infra.svc.cluster.local
+  IMGSRCH_POSTGRES__USER: imgsrch
+  IMGSRCH_MILVUS__HOST: milvus-proxy.imgsrch-infra.svc.cluster.local
+  IMGSRCH_KAFKA__BOOTSTRAP_SERVERS: kafka.imgsrch-infra.svc.cluster.local:9092
+  IMGSRCH_BITMAP_FILTER__HOST: bitmap-filter.imgsrch-app.svc.cluster.local
+  INFERENCE_SERVICE_URL: http://inference-service.imgsrch-app.svc.cluster.local:8090
+  INFERENCE_SERVICE_URLS: http://inference-service.imgsrch-app.svc.cluster.local:8090
+  REDIS_URL: redis://redis.imgsrch-infra.svc.cluster.local:6379/0
+  KAFKA_BROKERS: kafka.imgsrch-infra.svc.cluster.local:9092
+  MILVUS_HOST: milvus-proxy.imgsrch-infra.svc.cluster.local
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: search-service-secret
+  namespace: imgsrch-app
+  labels:
+    app: search-service
+type: Opaque
+stringData:
+  PG_DSN: postgresql://imgsrch:imgsrch_pass@postgres.imgsrch-infra.svc.cluster.local:5432/image_search
+  IMGSRCH_POSTGRES__PASSWORD: imgsrch_pass
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-service
+  namespace: imgsrch-app
+  labels:
+    app: search-service
+spec:
+  type: NodePort
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 52210
+      name: http
+  selector:
+    app: search-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-service
+  namespace: imgsrch-app
+  labels:
+    app: search-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: search-service
+  template:
+    metadata:
+      labels:
+        app: search-service
+    spec:
+      containers:
+        - name: search-service
+          image: imgsrch/search-service:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: search-service-config
+            - secretRef:
+                name: search-service-secret
+          resources:
+            requests:
+              memory: 4Gi
+              cpu: "2"
+            limits:
+              memory: 8Gi
+              cpu: "4"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+---
+# HPA: 根据 CPU 使用率自动扩缩 3-5 replicas
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: search-service-hpa
+  namespace: imgsrch-app
+  labels:
+    app: search-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: search-service
+  minReplicas: 3
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

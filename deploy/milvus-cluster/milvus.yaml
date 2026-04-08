@@ -1,0 +1,86 @@
+# ============================================================
+# Milvus v2.5.4 分布式集群配置
+# 针对单机 2TB RAM / 4x4090D / 大规模服装图搜 优化
+# ============================================================
+
+# ── 元数据存储: etcd 3 节点集群 ──
+etcd:
+  use:
+    embed: false
+  endpoints: etcd-node-1:2379,etcd-node-2:2379,etcd-node-3:2379
+  rootPath: by-dev          # 与 standalone 一致, 数据自动识别
+  requestTimeout: 60000     # ms, 大批量写入时避免超时
+
+# ── 对象存储: MinIO ──
+minio:
+  address: imgsrch-milvus-minio
+  port: 9000
+  accessKeyID: minioadmin
+  secretAccessKey: minioadmin
+  bucketName: a-bucket
+  rootPath: by-dev/files    # 默认路径, 与 standalone 一致
+  useSSL: false
+
+# ── 消息队列: Kafka ──
+msgChannel:
+  channel:
+    type: kafka
+kafka:
+  brokerList: kafka:29092
+  saslEnabled: false
+
+# ── DataCoord: segment 管理 ──
+dataCoord:
+  segment:
+    maxSize: 2048             # MB, 每 segment 最大 2GB
+    sealProportion: 0.25      # 25% 满即 seal
+  compaction:
+    enableAutoCompaction: true
+
+# ── DataNode: 写入缓冲 (2 节点) ──
+dataNode:
+  segment:
+    insertBufSize: 134217728  # 128MB, 分布式可用更大缓冲
+  flowgraph:
+    maxQueueLength: 32        # 双节点各 32 队列
+
+# ── IndexNode: 索引构建 (4 节点) ──
+indexNode:
+  scheduler:
+    buildParallel: 2          # 每节点 2 并发, 4 节点共 8 并发
+
+# ── IndexCoord: 索引调度 ──
+indexCoord:
+  scheduler:
+    interval: 5000            # 5s 检查间隔, 分布式可更频繁
+
+# ── QueryNode: 搜索性能 (3 节点, 各 128GB) ──
+queryNode:
+  gracefulStopTimeout: 60     # 秒, 分布式宽松一些
+  cache:
+    enabled: true
+  scheduler:
+    maxReadConcurrentRatio: 0.7   # 70% CPU 用于查询
+  loadMemoryUsageFactor: 2        # 内存充裕, 允许加载更多 segment
+
+# ── Proxy: 客户端连接 ──
+proxy:
+  maxInsertSize: 134217728    # 128MB
+  maxTaskNum: 2048            # 分布式可提高任务数
+  ginLogging: false           # 关闭 gin 日志减少噪音
+
+# ── Common: 通用配置 ──
+common:
+  gracefulStopTimeout: 120    # 秒
+  sessionTTL: 60              # 秒, 避免 etcd 慢时误判
+  sessionRetryTimes: 10
+  # 分布式集群需要
+  storageType: remote
+
+# ── 日志 ──
+log:
+  level: info
+  file:
+    maxSize: 300              # MB, 单个日志文件上限
+    maxAge: 7                 # 天
+    maxBackups: 5

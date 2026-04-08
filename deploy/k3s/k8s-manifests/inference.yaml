@@ -1,0 +1,123 @@
+# ============================================================
+# Inference Service — Deployment (GPU 调度)
+# 端口: 8090
+# NodePort: 52200
+# 每个 Pod 使用 1 张 GPU，通过 replicas 控制总 GPU 数
+# 4 节点 × 4 GPU = 最多 16 个 Pod
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-config
+  namespace: imgsrch-app
+  labels:
+    app: inference-service
+data:
+  CLIP_MODEL_PATH: /models/ViT-L-14.pt
+  FASHION_MODEL_PATH: /models/marqo-fashionsiglip
+  FASHION_TOKENIZER_PATH: /models/vit-b-16-siglip-tokenize
+  MILVUS_HOST: milvus-proxy.imgsrch-infra.svc.cluster.local
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-service
+  namespace: imgsrch-app
+  labels:
+    app: inference-service
+spec:
+  type: NodePort
+  ports:
+    - port: 8090
+      targetPort: 8090
+      nodePort: 52200
+      name: http
+  selector:
+    app: inference-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-service
+  namespace: imgsrch-app
+  labels:
+    app: inference-service
+spec:
+  # 4 节点 × 4 GPU，每 Pod 1 GPU = 16 个副本上限
+  # 初始设为 4 (每节点 1 个)，可按需扩展
+  replicas: 4
+  selector:
+    matchLabels:
+      app: inference-service
+  template:
+    metadata:
+      labels:
+        app: inference-service
+    spec:
+      # GPU 节点调度
+      nodeSelector:
+        gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: inference
+          image: imgsrch/inference-service:latest
+          ports:
+            - containerPort: 8090
+              name: http
+          envFrom:
+            - configMapRef:
+                name: inference-config
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+          resources:
+            requests:
+              memory: 8Gi
+              cpu: "2"
+              nvidia.com/gpu: 1
+            limits:
+              memory: 12Gi
+              cpu: "4"
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            # 共享内存 (PyTorch DataLoader 需要)
+            - name: dshm
+              mountPath: /dev/shm
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            timeoutSeconds: 5
+          # 模型加载需要较长时间
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 30
+      volumes:
+        - name: models
+          hostPath:
+            path: /data/imgsrch/models
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

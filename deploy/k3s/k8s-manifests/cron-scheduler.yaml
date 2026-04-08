@@ -1,0 +1,85 @@
+# ============================================================
+# Cron Scheduler — Deployment, 2 replicas
+# 端口: 8082
+# NodePort: 52230
+# 依赖: PostgreSQL, Redis, Kafka
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cron-scheduler-config
+  namespace: imgsrch-app
+  labels:
+    app: cron-scheduler
+data:
+  IMGSRCH_ENV: production
+  PORT: "8082"
+  PG_DSN: postgresql://imgsrch:imgsrch_pass@postgres.imgsrch-infra.svc.cluster.local:5432/image_search
+  REDIS_URL: redis://redis.imgsrch-infra.svc.cluster.local:6379/0
+  KAFKA_BROKERS: kafka.imgsrch-infra.svc.cluster.local:9092
+  MILVUS_HOST: milvus-proxy.imgsrch-infra.svc.cluster.local
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cron-scheduler
+  namespace: imgsrch-app
+  labels:
+    app: cron-scheduler
+spec:
+  type: NodePort
+  ports:
+    - port: 8082
+      targetPort: 8082
+      nodePort: 52230
+      name: http
+  selector:
+    app: cron-scheduler
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cron-scheduler
+  namespace: imgsrch-app
+  labels:
+    app: cron-scheduler
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cron-scheduler
+  template:
+    metadata:
+      labels:
+        app: cron-scheduler
+    spec:
+      containers:
+        - name: cron-scheduler
+          image: imgsrch/cron-scheduler:latest
+          ports:
+            - containerPort: 8082
+              name: http
+          envFrom:
+            - configMapRef:
+                name: cron-scheduler-config
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: "250m"
+            limits:
+              memory: 1Gi
+              cpu: "1"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3

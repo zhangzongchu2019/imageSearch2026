@@ -40,6 +40,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("batch_import")
+# 抑制 httpx 每条请求的 INFO 日志 (严重拖慢高并发下载)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def emit_progress(stage: str, completed: int, total: int, message: str):
@@ -51,14 +54,32 @@ def emit_progress(stage: str, completed: int, total: int, message: str):
 # ── Constants ────────────────────────────────────────────────────────────────
 EMBEDDING_DIM = 256
 CLIP_DIM = 768  # ViT-L-14
-MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+def _detect_milvus_host():
+    """Auto-detect Milvus host: try localhost first, fallback to imgsrch-milvus (for Docker containers)."""
+    host = os.getenv("MILVUS_HOST")
+    if host:
+        return host
+    import socket
+    for candidate in ["localhost", "imgsrch-milvus"]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect((candidate, 19530))
+            s.close()
+            return candidate
+        except:
+            pass
+    return "localhost"
+
+MILVUS_HOST = _detect_milvus_host()
 MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 PG_DSN = os.getenv("PG_DSN", "postgresql://imgsrch:imgsrch_pass@localhost:5432/image_search")
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 COLLECTION_NAME = "global_images_hot"
-PARTITION_NAME = "p_202603"
-TS_MONTH = 202603
-DOWNLOAD_CONCURRENCY = 6      # per-channel concurrency
+PARTITION_NAME = os.getenv("PARTITION_NAME", "p_202604")
+TS_MONTH = int(os.getenv("TS_MONTH", "202604"))
+IS_EVERGREEN = False
+DOWNLOAD_CONCURRENCY = 500    # per-channel concurrency (COS 缩图有服务端延迟, 需高并发)
 GPU_BATCH_SIZE = 128
 MILVUS_BATCH_SIZE = 5000
 MERCHANT_ID_START = 10001
@@ -390,8 +411,12 @@ async def download_images(
         transport = None
         if proxy:
             transport = httpx.AsyncHTTPTransport(proxy=proxy)
+        if transport is None:
+            transport = httpx.AsyncHTTPTransport(
+                limits=httpx.Limits(max_connections=300, max_keepalive_connections=200),
+            )
         client = httpx.AsyncClient(
-            timeout=30,
+            timeout=60,
             headers=dl_headers,
             transport=transport,
         )
@@ -405,14 +430,19 @@ async def download_images(
         async with sem:
             fname = f"{meta['image_pk'][:16]}.jpg"
             fpath = os.path.join(download_dir, fname)
-            if os.path.exists(fpath) and os.path.getsize(fpath) > 1000:
+            if os.path.exists(fpath) and os.path.getsize(fpath) > 100:
                 meta["local_path"] = fpath
                 success += 1
                 return
             try:
-                resp = await client.get(meta["uri"], follow_redirects=True)
+                # COS 服务端缩图: 224×224 (CLIP 输入尺寸), 减少 ~70x 传输量
+                dl_url = meta["uri"]
+                if "myqcloud.com" in dl_url:
+                    sep = "&" if "?" in dl_url else "?"
+                    dl_url += f"{sep}imageMogr2/thumbnail/224x224"
+                resp = await client.get(dl_url, follow_redirects=True)
                 ct = resp.headers.get("content-type", "")
-                is_image = ct.startswith("image/") or len(resp.content) > 2000
+                is_image = ct.startswith("image/") or len(resp.content) > 200
                 if resp.status_code == 200 and is_image:
                     with open(fpath, "wb") as f:
                         f.write(resp.content)
@@ -427,8 +457,7 @@ async def download_images(
                 failed += 1
                 if tracker:
                     tracker.record_download_failure(meta["uri"], meta["image_pk"], str(e)[:200])
-            # Small delay to avoid bursting
-            await asyncio.sleep(0.05)
+            # COS 内网无需限速
 
     # Round-robin assign tasks to channels
     tasks = []
@@ -439,7 +468,7 @@ async def download_images(
     total_tasks = len(tasks)
     log.info(f"Downloading {total_tasks} images across {len(channels)} channels ...")
 
-    chunk_size = 500
+    chunk_size = 2000
     for i in range(0, len(tasks), chunk_size):
         chunk = tasks[i : i + chunk_size]
         await asyncio.gather(*chunk, return_exceptions=True)
@@ -518,7 +547,7 @@ class CLIPFeatureExtractor:
         # 预计算文本特征
         self._init_text_features()
 
-        # 尝试加载 FashionSigLIP
+        # FashionSigLIP (优化: 复用PIL对象 + 快速preprocess + 批量encode)
         self.fashion_model = None
         self._init_fashion_model()
 
@@ -640,12 +669,45 @@ class CLIPFeatureExtractor:
             log.warning(f"FashionSigLIP not loaded: {e}")
             self.fashion_model = None
 
-    def _load_image(self, path: str) -> Optional[torch.Tensor]:
+    def _load_image(self, path: str) -> Optional[tuple[torch.Tensor, Image.Image]]:
+        """返回 (preprocessed_tensor, pil_image) — pil_image 供 FashionSigLIP 复用"""
         try:
             img = Image.open(path).convert("RGB")
-            return self.preprocess(img)
+            if img.size == (224, 224):
+                return self._fast_preprocess(img), img
+            return self.preprocess(img), img
         except Exception:
             return None
+
+    _fast_transform = None
+    _fashion_fast_transform = None
+
+    def _fast_preprocess(self, img):
+        """跳过 Resize/CenterCrop, 直接 ToTensor + Normalize (已经是 224x224)"""
+        if self._fast_transform is None:
+            from torchvision import transforms
+            self.__class__._fast_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=(0.48145466, 0.4578275, 0.40821073),
+                    std=(0.26862954, 0.26130258, 0.27577711),
+                ),
+            ])
+        return self._fast_transform(img)
+
+    def _fast_fashion_preprocess(self, img):
+        """FashionSigLIP 快速路径 (224x224 已匹配, 跳过 Resize)"""
+        if self._fashion_fast_transform is None:
+            from torchvision import transforms
+            # FashionSigLIP (ViT-B-16-SigLIP) 同样用 224x224 输入, 同样的 normalize
+            self.__class__._fashion_fast_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=(0.48145466, 0.4578275, 0.40821073),
+                    std=(0.26862954, 0.26130258, 0.27577711),
+                ),
+            ])
+        return self._fashion_fast_transform(img)
 
     def _project(self, features_768: np.ndarray) -> np.ndarray:
         """Project 768-dim features to 256-dim using orthogonal matrix + L2 normalize."""
@@ -706,28 +768,111 @@ class CLIPFeatureExtractor:
             })
         return results
 
-    def _classify_fashion_l2l3(self, paths: list[str], classifications: list[dict]):
-        """对时尚类图片做 FashionSigLIP L2/L3 分类"""
+    def _classify_fashion_l2l3_fast(self, pil_images: list, classifications: list[dict]):
+        """FashionSigLIP L2/L3 批量分类 (复用已加载的 PIL 对象, 无重复 IO)"""
         if self.fashion_model is None:
             return
 
+        fashion_indices = []
         for i, cls in enumerate(classifications):
-            if not cls["_is_fashion"]:
-                continue
+            if cls["_is_fashion"] and cls["category_l1_id"] in self.fashion_l2_features:
+                fashion_indices.append(i)
+
+        if not fashion_indices:
+            return
+
+        # 批量预处理 (复用 PIL 对象, 快速路径跳过 Resize)
+        tensors = []
+        valid_indices = []
+        for idx in fashion_indices:
+            try:
+                img = pil_images[idx]
+                if img.size == (224, 224):
+                    tensors.append(self._fast_fashion_preprocess(img))
+                else:
+                    tensors.append(self.fashion_preprocess(img))
+                valid_indices.append(idx)
+            except Exception:
+                pass
+
+        if not tensors:
+            return
+
+        batch = torch.stack(tensors).to(self.device)
+        with torch.no_grad():
+            feats = self.fashion_model.encode_image(batch)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        feats = feats.float()
+
+        for feat_idx, orig_idx in enumerate(valid_indices):
+            cls = classifications[orig_idx]
             l1_code = cls["category_l1_id"]
-            if l1_code not in self.fashion_l2_features:
-                continue
+            feat = feats[feat_idx:feat_idx + 1]
+            try:
+                l2_feats = self.fashion_l2_features[l1_code].float()
+                l2_sims = (feat @ l2_feats.T).squeeze(0)
+                l2_idx = l2_sims.argmax().item()
+                cls["category_l2"] = self.fashion_l2_names[l1_code][l2_idx]
+                cls["category_l2_id"] = self.fashion_l2_codes[l1_code][l2_idx]
+                l2_code = cls["category_l2_id"]
+                if l2_code in self.fashion_l3_features:
+                    l3_feats = self.fashion_l3_features[l2_code].float()
+                    l3_sims = (feat @ l3_feats.T).squeeze(0)
+                    l3_idx = l3_sims.argmax().item()
+                    cls["category_l3"] = self.fashion_l3_names[l2_code][l3_idx]
+                    cls["category_l3_id"] = self.fashion_l3_codes[l2_code][l3_idx]
+            except Exception:
+                pass
+
+    def _classify_fashion_l2l3(self, paths: list[str], classifications: list[dict]):
+        """对时尚类图片做 FashionSigLIP L2/L3 批量分类。
+
+        优化: 收集整个 batch 中的时尚类图片, 一次 encode_image,
+        再按 L1 code 分组做 L2/L3 分类 (矩阵运算)。
+        """
+        if self.fashion_model is None:
+            return
+
+        # 1. 收集时尚类图片 index
+        fashion_indices = []
+        for i, cls in enumerate(classifications):
+            if cls["_is_fashion"] and cls["category_l1_id"] in self.fashion_l2_features:
+                fashion_indices.append(i)
+
+        if not fashion_indices:
+            return
+
+        # 2. 批量加载 + 预处理
+        tensors = []
+        valid_indices = []  # 成功加载的 index
+        for idx in fashion_indices:
+            try:
+                img = Image.open(paths[idx]).convert("RGB")
+                tensors.append(self.fashion_preprocess(img))
+                valid_indices.append(idx)
+            except Exception as e:
+                log.warning(f"FashionSigLIP load failed for {paths[idx]}: {e}")
+
+        if not tensors:
+            return
+
+        # 3. 一次批量 encode
+        batch = torch.stack(tensors).to(self.device)
+        with torch.no_grad():
+            feats = self.fashion_model.encode_image(batch)  # (N, D)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        feats = feats.float()
+
+        # 4. 按 L1 code 分组做 L2/L3 分类 (矩阵运算)
+        for feat_idx, orig_idx in enumerate(valid_indices):
+            cls = classifications[orig_idx]
+            l1_code = cls["category_l1_id"]
+            feat = feats[feat_idx:feat_idx + 1]  # (1, D)
 
             try:
-                img = Image.open(paths[i]).convert("RGB")
-                img_tensor = self.fashion_preprocess(img).unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    feat = self.fashion_model.encode_image(img_tensor)
-                feat = feat / feat.norm(dim=-1, keepdim=True)
-
                 # L2
                 l2_feats = self.fashion_l2_features[l1_code].float()
-                l2_sims = (feat.float() @ l2_feats.T).squeeze(0)
+                l2_sims = (feat @ l2_feats.T).squeeze(0)
                 l2_idx = l2_sims.argmax().item()
                 cls["category_l2"] = self.fashion_l2_names[l1_code][l2_idx]
                 cls["category_l2_id"] = self.fashion_l2_codes[l1_code][l2_idx]
@@ -736,23 +881,25 @@ class CLIPFeatureExtractor:
                 l2_code = cls["category_l2_id"]
                 if l2_code in self.fashion_l3_features:
                     l3_feats = self.fashion_l3_features[l2_code].float()
-                    l3_sims = (feat.float() @ l3_feats.T).squeeze(0)
+                    l3_sims = (feat @ l3_feats.T).squeeze(0)
                     l3_idx = l3_sims.argmax().item()
                     cls["category_l3"] = self.fashion_l3_names[l2_code][l3_idx]
                     cls["category_l3_id"] = self.fashion_l3_codes[l2_code][l3_idx]
-
             except Exception as e:
-                log.warning(f"FashionSigLIP classify failed for {paths[i]}: {e}")
+                log.warning(f"FashionSigLIP L2/L3 failed for {paths[orig_idx]}: {e}")
 
     @torch.no_grad()
     def extract_batch(self, paths: list[str]) -> tuple[list[str], np.ndarray, list[dict]]:
         """Extract 256-dim features + two-stage classification for a batch."""
         tensors = []
+        pil_images = []  # 保留 PIL 对象供 FashionSigLIP 复用
         valid_paths = []
         for p in paths:
-            t = self._load_image(p)
-            if t is not None:
-                tensors.append(t)
+            result = self._load_image(p)
+            if result is not None:
+                tensor, pil_img = result
+                tensors.append(tensor)
+                pil_images.append(pil_img)
                 valid_paths.append(p)
 
         if not tensors:
@@ -764,8 +911,8 @@ class CLIPFeatureExtractor:
         # Stage 1: L1 分类 + 标签 + 非时尚 L2
         classifications = self._classify_batch_l1(features)
 
-        # Stage 2: 时尚类 L2/L3 (FashionSigLIP)
-        self._classify_fashion_l2l3(valid_paths, classifications)
+        # Stage 2: 时尚类 L2/L3 (FashionSigLIP 批量推理, 复用 PIL 对象)
+        self._classify_fashion_l2l3_fast(pil_images, classifications)
 
         features_768 = features.cpu().numpy().astype(np.float32)
         features_256 = self._project(features_768)
@@ -773,7 +920,7 @@ class CLIPFeatureExtractor:
         return valid_paths, features_256, classifications
 
     def extract_all(self, image_metas: list[dict]) -> list[dict]:
-        """Extract features + two-stage classification for all images."""
+        """Extract features + two-stage classification for all images (single GPU)."""
         paths = [m["local_path"] for m in image_metas]
         path_to_meta = {m["local_path"]: m for m in image_metas}
 
@@ -834,14 +981,192 @@ class CLIPFeatureExtractor:
         return result
 
 
+# ── Multi-GPU 并行特征提取 ──────────────────────────────────────────────────
+
+def _gpu_worker(args_tuple):
+    """单个 GPU worker: 加载模型到指定 GPU，处理分配到的图片子集。
+    在独立进程中运行，避免 GIL 和 CUDA context 冲突。"""
+    gpu_id, paths_chunk, model_path, progress_file = args_tuple
+    import json as _json
+
+    device = f"cuda:{gpu_id}"
+    log.info(f"[GPU{gpu_id}] Loading models on {device}, {len(paths_chunk)} images...")
+    extractor = CLIPFeatureExtractor(device=device, model_path=model_path)
+
+    all_256 = []
+    all_valid_paths = []
+    all_classifications = []
+    total_batches = (len(paths_chunk) + GPU_BATCH_SIZE - 1) // GPU_BATCH_SIZE
+    t0 = time.time()
+
+    for i in range(0, len(paths_chunk), GPU_BATCH_SIZE):
+        batch_paths = paths_chunk[i : i + GPU_BATCH_SIZE]
+        valid_paths, features_256, classifications = extractor.extract_batch(batch_paths)
+        all_valid_paths.extend(valid_paths)
+        all_classifications.extend(classifications)
+        if len(features_256) > 0:
+            all_256.append(features_256)
+
+        batch_num = i // GPU_BATCH_SIZE + 1
+        if batch_num % 10 == 0 or batch_num == total_batches:
+            elapsed = time.time() - t0
+            rate = len(all_valid_paths) / elapsed if elapsed > 0 else 0
+            log.info(f"  [GPU{gpu_id}] Batch {batch_num}/{total_batches}, "
+                     f"{len(all_valid_paths)} done, {rate:.0f} img/sec")
+            # 写进度到临时文件供主进程汇总
+            try:
+                with open(progress_file, "w") as f:
+                    _json.dump({"gpu": gpu_id, "done": len(all_valid_paths),
+                                "total": len(paths_chunk), "rate": round(rate, 1)}, f)
+            except Exception:
+                pass
+
+    if not all_256:
+        return [], [], []
+
+    all_256_np = np.concatenate(all_256, axis=0)
+    elapsed = time.time() - t0
+    log.info(f"[GPU{gpu_id}] Done: {len(all_valid_paths)} images in {elapsed:.1f}s "
+             f"({len(all_valid_paths)/elapsed:.0f} img/s)")
+
+    # 返回 (paths, vectors_as_list, classifications)
+    return all_valid_paths, all_256_np.tolist(), all_classifications
+
+
+def extract_all_multi_gpu(image_metas: list[dict], model_path: str = None,
+                          num_gpus: int = None) -> list[dict]:
+    """4 卡并行特征提取 + 两级分类。用 multiprocessing.Pool spawn 模式。"""
+    import torch.multiprocessing as mp
+
+    if num_gpus is None:
+        num_gpus = torch.cuda.device_count()
+    num_gpus = min(num_gpus, torch.cuda.device_count())
+    if num_gpus <= 1:
+        log.info("Only 1 GPU available, falling back to single-GPU extract_all")
+        ext = CLIPFeatureExtractor(device="cuda", model_path=model_path)
+        return ext.extract_all(image_metas)
+
+    paths = [m["local_path"] for m in image_metas]
+    path_to_meta = {m["local_path"]: m for m in image_metas}
+    total = len(paths)
+
+    # 均分到各 GPU
+    chunk_size = (total + num_gpus - 1) // num_gpus
+    chunks = [paths[i:i + chunk_size] for i in range(0, total, chunk_size)]
+    log.info(f"Multi-GPU extraction: {total} images across {len(chunks)} GPUs "
+             f"(~{chunk_size} each)")
+
+    # 进度文件
+    progress_dir = "/tmp/gpu_progress"
+    os.makedirs(progress_dir, exist_ok=True)
+    progress_files = [f"{progress_dir}/gpu_{i}.json" for i in range(len(chunks))]
+
+    # 启动进度汇总线程
+    import threading
+    _stop_progress = threading.Event()
+
+    def _progress_reporter():
+        while not _stop_progress.is_set():
+            time.sleep(5)
+            total_done = 0
+            rates = []
+            for pf in progress_files:
+                try:
+                    with open(pf) as f:
+                        d = json.load(f)
+                    total_done += d.get("done", 0)
+                    rates.append(d.get("rate", 0))
+                except Exception:
+                    pass
+            agg_rate = sum(rates)
+            log.info(f"  [ALL GPUs] {total_done}/{total} done, {agg_rate:.0f} img/sec total")
+            emit_progress("extract", total_done, total,
+                          f"{len(chunks)} GPUs, {agg_rate:.0f} img/sec total")
+
+    reporter = threading.Thread(target=_progress_reporter, daemon=True)
+    reporter.start()
+
+    # 构造参数
+    worker_args = [
+        (i, chunks[i], model_path, progress_files[i])
+        for i in range(len(chunks))
+    ]
+
+    t0 = time.time()
+    try:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=len(chunks)) as pool:
+            results = pool.map(_gpu_worker, worker_args)
+    finally:
+        _stop_progress.set()
+        reporter.join(timeout=2)
+
+    # 合并结果
+    all_valid_paths = []
+    all_256 = []
+    all_classifications = []
+    for vpaths, vecs_list, clss in results:
+        if vpaths:
+            all_valid_paths.extend(vpaths)
+            all_256.append(np.array(vecs_list, dtype=np.float32))
+            all_classifications.extend(clss)
+
+    if not all_256:
+        log.error("Multi-GPU extraction produced no results!")
+        return []
+
+    all_256_np = np.concatenate(all_256, axis=0)
+    elapsed = time.time() - t0
+    log.info(f"Multi-GPU done: {len(all_valid_paths)} images, {all_256_np.shape}, "
+             f"{elapsed:.1f}s ({len(all_valid_paths)/elapsed:.0f} img/s total)")
+
+    # 统计品类分布
+    cat_counts: dict[str, int] = {}
+    for cls in all_classifications:
+        cat_counts[cls["category_l1"]] = cat_counts.get(cls["category_l1"], 0) + 1
+    log.info(f"Category distribution: {cat_counts}")
+
+    # Map back
+    result = []
+    for path, vec, cls in zip(all_valid_paths, all_256_np, all_classifications):
+        meta = path_to_meta[path]
+        meta["global_vec"] = vec.tolist()
+        meta["category_l1"] = cls["category_l1_id"]
+        meta["category_l1_name"] = cls["category_l1"]
+        meta["category_l1_conf"] = cls["category_l1_conf"]
+        meta["category_l2"] = cls.get("category_l2_id", 0)
+        meta["category_l3"] = cls.get("category_l3_id", 0)
+        meta["tags"] = cls["tags"]
+        meta["tags_name"] = cls["tags_name"]
+        result.append(meta)
+
+    log.info(f"Multi-GPU extraction + classification complete: {len(result)} images")
+    return result
+
+
 # ── 4. Milvus Insert ─────────────────────────────────────────────────────────
 
 def insert_milvus(image_metas: list[dict]):
     """Batch upsert into Milvus global_images_hot."""
     from pymilvus import connections, Collection, utility
 
-    log.info(f"Connecting to Milvus at {MILVUS_HOST}:{MILVUS_PORT}...")
-    connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+    # Try configured host, fallback to container name if in Docker
+    milvus_host = MILVUS_HOST
+    for candidate in [MILVUS_HOST, "imgsrch-milvus", "localhost"]:
+        try:
+            log.info(f"Connecting to Milvus at {candidate}:{MILVUS_PORT}...")
+            connections.connect(alias="default", host=candidate, port=MILVUS_PORT, timeout=10)
+            milvus_host = candidate
+            break
+        except Exception as e:
+            log.warning(f"Failed to connect to {candidate}:{MILVUS_PORT}: {e}")
+            try:
+                connections.disconnect("default")
+            except:
+                pass
+    else:
+        log.error("Cannot connect to Milvus on any host!")
+        sys.exit(1)
 
     if not utility.has_collection(COLLECTION_NAME):
         log.error(f"Collection {COLLECTION_NAME} does not exist! "
@@ -850,8 +1175,8 @@ def insert_milvus(image_metas: list[dict]):
 
     coll = Collection(COLLECTION_NAME)
 
-    # Ensure partition exists
-    if not coll.has_partition(PARTITION_NAME):
+    # Ensure partition exists (skip for independent collections like img_999999)
+    if PARTITION_NAME != "_default" and not coll.has_partition(PARTITION_NAME):
         log.info(f"Creating partition {PARTITION_NAME}...")
         coll.create_partition(PARTITION_NAME)
 
@@ -868,7 +1193,7 @@ def insert_milvus(image_metas: list[dict]):
                 "image_pk": m["image_pk"],
                 "global_vec": m["global_vec"],
                 "product_id": m.get("product_id", f"P0{m['index']:07d}"),
-                "is_evergreen": False,
+                "is_evergreen": IS_EVERGREEN,
                 "category_l1": m.get("category_l1", 0),
                 "category_l2": m.get("category_l2", 0),
                 "category_l3": m.get("category_l3", 0),
@@ -1266,7 +1591,26 @@ def main():
                              "(e.g. socks5://127.0.0.1:61081,socks5://127.0.0.1:61082)")
     parser.add_argument("--backup-dir", type=str, default=None,
                         help="Local backup directory (images + metadata.jsonl)")
+    parser.add_argument("--partition", type=str, default=None,
+                        help="Milvus partition name (e.g. p_202604_svip)")
+    parser.add_argument("--ts-month", type=int, default=None,
+                        help="ts_month value (e.g. 202604)")
+    parser.add_argument("--evergreen", action="store_true",
+                        help="Set is_evergreen=True for evergreen partition")
+    parser.add_argument("--collection", type=str, default=None,
+                        help="Milvus collection name (default: global_images_hot)")
     args = parser.parse_args()
+
+    # 命令行参数覆盖全局常量
+    global PARTITION_NAME, TS_MONTH, IS_EVERGREEN, COLLECTION_NAME
+    if args.partition:
+        PARTITION_NAME = args.partition
+    if args.ts_month:
+        TS_MONTH = args.ts_month
+    if args.evergreen:
+        IS_EVERGREEN = True
+    if args.collection:
+        COLLECTION_NAME = args.collection
 
     asyncio.run(async_main(args))
 

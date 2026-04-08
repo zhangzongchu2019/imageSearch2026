@@ -1,0 +1,157 @@
+# ============================================================
+# PostgreSQL 16 — StatefulSet (3 replicas, Patroni HA)
+# 端口: 5432
+# NodePort: 52020
+# 存储: 100Gi per replica
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: imgsrch-infra
+  labels:
+    app: postgres
+type: Opaque
+stringData:
+  POSTGRES_USER: imgsrch
+  POSTGRES_PASSWORD: imgsrch_pass
+  POSTGRES_DB: image_search
+  # Patroni 配置
+  PATRONI_SUPERUSER_USERNAME: postgres
+  PATRONI_SUPERUSER_PASSWORD: postgres_super_pass
+  PATRONI_REPLICATION_USERNAME: replicator
+  PATRONI_REPLICATION_PASSWORD: replicator_pass
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: imgsrch-infra
+  labels:
+    app: postgres
+data:
+  # Patroni 初始化后的 PostgreSQL 配置
+  postgresql.conf: |
+    max_connections = 200
+    shared_buffers = 2GB
+    effective_cache_size = 6GB
+    maintenance_work_mem = 512MB
+    work_mem = 32MB
+    wal_level = replica
+    max_wal_senders = 5
+    max_replication_slots = 5
+    hot_standby = on
+    logging_collector = on
+    log_directory = 'log'
+    log_min_duration_statement = 1000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: imgsrch-infra
+  labels:
+    app: postgres
+spec:
+  type: NodePort
+  ports:
+    - port: 5432
+      targetPort: 5432
+      nodePort: 52020
+      name: postgres
+  selector:
+    app: postgres
+---
+# Headless Service (StatefulSet 需要)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: imgsrch-infra
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: imgsrch-infra
+  labels:
+    app: postgres
+spec:
+  serviceName: postgres-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          envFrom:
+            - secretRef:
+                name: postgres-secret
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "1"
+            limits:
+              memory: 4Gi
+              cpu: "4"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - imgsrch
+                - -d
+                - image_search
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - imgsrch
+                - -d
+                - image_search
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
