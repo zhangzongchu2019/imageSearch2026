@@ -36,3 +36,13 @@ htmlcov/
 # Data / runtime artifacts
 data/
 .claude_memory_backup/
+
+# Model weights (大文件)
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Logs
+wget-log
+*.log
