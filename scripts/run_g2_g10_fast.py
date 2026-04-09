@@ -66,7 +66,7 @@ def infer_batch(batch, infer_dir):
         out = os.path.join(infer_dir, f"infer_gpu{gpu}.jsonl")
         # 清空旧文件 (通过 docker exec, 因为文件可能由 root 创建)
         subprocess.run(["docker", "exec", "gpu_worker", "bash", "-c",
-                        f"mkdir -p {infer_dir} && : > {out}"], timeout=10)
+                        f"mkdir -p {infer_dir} && : > {out}"], timeout=30)
         cmd = (f"CUDA_VISIBLE_DEVICES={gpu} python3 /workspace/scripts/infer_gpu_fast.py "
                f"--image-dir {dst} --output {out} "
                f"--gpu {gpu} --shard {GPUS.index(gpu)} --total-shards {len(GPUS)} "
